@@ -56,6 +56,30 @@ python build_exe.py     # 自己打包成单文件 exe（需 pip install pyinsta
 
 ## 界面
 
+![概览](docs/preview/overview.png)
+
+<details>
+<summary>更多界面截图（点击展开）</summary>
+
+**下载页**：多线程任务、实时速度、批量暂停/继续
+
+![下载](docs/preview/download.png)
+
+**共享网络**：自动发现同一局域网里其他主机的共享，一行内点开 HTTP / SMB / FTP
+
+![共享网络](docs/preview/peers.png)
+
+**服务设置**：端口、账号、监听网卡、限速（滑块实时显示 + 手动输入）
+
+![服务设置](docs/preview/servers.png)
+
+**限速**：拖动实时显示数值，也可直接输入 MB/s
+
+![限速](docs/preview/limits.png)
+
+</details>
+
+
 六个页面：
 
 - **概览**：三张协议磁贴（状态灯 / 访问地址 / 连接数 / 端口，可直接启动停止）、
