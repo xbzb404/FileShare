@@ -4,7 +4,7 @@
 > **HTTP（浏览器直接下）/ FTP（资源管理器挂载）/ Windows 共享（SMB）三种协议同时开，一个窗口管全**，
 > 还能看到谁在下载、占了多少带宽。
 
-作者：**by zhb** · 版本 1.0.0 · 界面：tkinter + Canvas 自绘（Win11 Fluent 风格）· 单文件 exe 21.6 MB
+作者：**by zhb** · 版本 1.0.0 · 界面：tkinter + Canvas 自绘（Win11 Fluent 风格）· 单文件 exe 22.7 MB
 
 ---
 
@@ -25,10 +25,25 @@
 
 ## 快速上手
 
-1. 双击 `FileShare.exe`（单文件，不用安装）。
-2. 「共享目录」页点 **添加目录**，选一个文件夹（电影、软件、照片都行）。
-3. 右上角 **全部启动**（默认开机首次启动时 HTTP/FTP 已经自动起来了）。
-4. 同一局域网的设备访问里面显示的地址：
+**方式一：直接下载可执行文件**（推荐给只想用的）
+
+到本仓库的 [Releases](../../releases) 下载 `FileShare.exe`，双击即可（单文件、免安装、无依赖）。
+
+**方式二：从源码运行**（Python 3.10+，无第三方依赖）
+
+```bash
+git clone git@github.com:xbzb404/FileShare.git
+cd FileShare
+python main.py          # 直接运行
+python -m unittest discover -s tests    # 跑测试（74 项）
+python build_exe.py     # 自己打包成单文件 exe（需 pip install pyinstaller）
+```
+
+**用法**
+
+1. 「共享目录」页点 **添加目录**，选一个文件夹（电影、软件、照片都行）。
+2. 服务默认会自动启动；也可以在 **概览** 页的协议磁贴或 **服务设置** 页逐个启停。
+3. 同一局域网的设备访问里面显示的地址：
    - 浏览器：`http://192.168.x.x:8080/`
    - 资源管理器：`ftp://192.168.x.x:2121/`（账号 `share`，密码 `fileshare`，可在设置页改）
    - Windows 共享：`\\192.168.x.x\目录名`（需要管理员权限，见下）
