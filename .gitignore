@@ -1,0 +1,30 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 构建产物（可重建，不入库）
+build/
+build_old_*/
+spec/
+spec_old_*/
+dist/
+dist_old_*/
+*_old_*
+
+# 运行期文件
+FileShare_error.log
+diag.json
+*.fsmeta
+*.fspart
+*.fsupload
+screenshots/_probe_config.json
+_*.json
+
+# 截图（按需保留，默认不入库）
+screenshots/*.png
+!screenshots/.gitkeep
+
+# 探针/运行残留（含本机绝对路径，绝不入库）
+screenshots/downloads.json
+screenshots/_probe_config.json
+screenshots/*.log
