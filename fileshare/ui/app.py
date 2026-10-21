@@ -163,10 +163,17 @@ class App(object):
 
         right = tk.Frame(top, bg=t["bg"])
         right.pack(side="right")
-        self.btn_all = PillButton(right, self.fonts, t, "全部暂停",
-                                  command=self._toggle_all, style="primary",
-                                  icon="play", height=32)
-        self.btn_all.pack(side="right", padx=(T.px(8), 0))
+        # 主操作按钮的固定槽位：非下载页放「全部启动/全部停止」服务控制，
+        # 下载页换成「全部暂停/全部继续」。两个按钮同一位置交替显示。
+        self.btn_slot = tk.Frame(right, bg=t["bg"])
+        self.btn_slot.pack(side="right", padx=(T.px(8), 0))
+        self.btn_all = PillButton(self.btn_slot, self.fonts, t, "全部启动",
+                                  command=self._toggle_services,
+                                  style="primary", icon="play", height=32)
+        self.btn_dl = PillButton(self.btn_slot, self.fonts, t, "全部暂停",
+                                 command=self._toggle_all,
+                                 style="primary", icon="play", height=32)
+        self.btn_all.pack(side="right")
         self.btn_theme = PillButton(right, self.fonts, t, "深色",
                                     command=self._toggle_theme,
                                     style="secondary", icon="theme", height=32)
@@ -237,7 +244,7 @@ class App(object):
 
         self.render_page()
         self._refresh_admin_label()
-        self._refresh_all_button()
+        self._sync_header_buttons()
 
     def _build_logview(self, parent):
         t = self.theme
@@ -287,6 +294,7 @@ class App(object):
         self.page = key
         for k, item in self.nav_items.items():
             item.set_selected(k == key)
+        self._sync_header_buttons()
         self.render_page()
         if first_visit:
             # 切回「共享网络」页就主动扫一次（后台线程，界面无感）
@@ -1602,6 +1610,43 @@ class App(object):
         if self.page in ("overview", "servers"):
             self.render_page()
 
+    def _toggle_services(self):
+        """顶栏（非下载页）：一键启停全部服务。"""
+        any_on = any(self.manager.is_running(x) for x in ("http", "ftp", "smb"))
+        for proto in ("http", "ftp"):
+            if any_on:
+                if self.manager.is_running(proto):
+                    self._toggle_proto(proto, False)
+            else:
+                if not self.manager.is_running(proto):
+                    self._toggle_proto(proto, True)
+        if self.cfg.get("smb", "enabled") and is_admin():
+            self._toggle_proto("smb", not any_on)
+        self._refresh_all_button()
+
+    def _refresh_all_button(self):
+        """服务控制按钮文案跟着实际状态走（幂等）。"""
+        any_on = any(self.manager.is_running(x) for x in ("http", "ftp", "smb"))
+        want = "全部停止" if any_on else "全部启动"
+        if self.btn_all.text != want:
+            self.btn_all.config_text(want)
+
+    def _sync_header_buttons(self):
+        """按当前页决定槽位里显示哪个按钮。
+
+        下载批量控制（全部暂停/继续）只属于下载页；其它页面一律是
+        服务控制（全部启动/停止）——这两件事混在一个按钮上会让人懵。
+        """
+        on_dl = self.page == "download"
+        self.btn_all.pack_forget()
+        self.btn_dl.pack_forget()
+        if on_dl:
+            self.btn_dl.pack(side="right")
+            self._refresh_dl_button()
+        else:
+            self.btn_all.pack(side="right")
+            self._refresh_all_button()
+
     def _toggle_all(self):
         """顶栏按钮：批量暂停 / 继续所有下载任务。"""
         if self.downloader.active_count():
@@ -1615,22 +1660,22 @@ class App(object):
                     resumed += 1
             self._toast("已继续 %d 个任务" % resumed if resumed
                         else "没有可继续的任务")
-        self._refresh_all_button()
+        self._refresh_dl_button()
         if self.page in ("download",):
             self.render_page()
 
-    def _refresh_all_button(self):
-        """无任务 → 置灰不可点；有任务 → 全部暂停 / 全部继续（幂等）。"""
+    def _refresh_dl_button(self):
+        """下载按钮：无任务 → 置灰不可点；有任务 → 全部暂停 / 全部继续（幂等）。"""
         tasks = self.downloader.tasks
         active = self.downloader.active_count()
         want_on = bool(tasks)
         want_text = "全部暂停" if active else "全部继续"
         if not tasks:
             want_text = "全部暂停"
-        if self.btn_all._enabled != want_on:
-            self.btn_all.set_enabled(want_on)
-        if self.btn_all.text != want_text:
-            self.btn_all.config_text(want_text)
+        if self.btn_dl._enabled != want_on:
+            self.btn_dl.set_enabled(want_on)
+        if self.btn_dl.text != want_text:
+            self.btn_dl.config_text(want_text)
 
     def _add_share(self):
         path = filedialog.askdirectory(title="选择要共享的目录")
@@ -2255,8 +2300,8 @@ class App(object):
         self._sync_log()
         if self._dl_seen != self._dl_version:
             self._dl_seen = self._dl_version
-            # 任务增减/状态变化都要重算顶栏按钮的可用性与文案
-            self._refresh_all_button()
+            # 任务增减/状态变化都要重算下载按钮的可用性与文案
+            self._refresh_dl_button()
             if self.page == "download":
                 self.render_page()
         self._poll_job = self.root.after(100, self._poll)
@@ -2275,7 +2320,8 @@ class App(object):
             return
         up, down, dl = self.manager.stats.sample()
         self._last_speed = (up, down, dl)
-        self._refresh_all_button()          # 顶栏按钮随任务状态走（幂等）
+        self._refresh_all_button()          # 服务按钮随服务状态走（幂等）
+        self._refresh_dl_button()           # 下载按钮随任务状态走（幂等）
         self._avg30 = self.manager.stats.avg(30)
         self._traffic_rows = self.manager.traffic.sample()
         self._traffic_agg = _by_ip(self._traffic_rows)

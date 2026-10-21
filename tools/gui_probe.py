@@ -95,7 +95,10 @@ def main():
 
     # 用临时配置，绝不动用户真实设置
     tmpcfg = os.path.join(OUT, "_probe_config.json")
-    for p in (tmpcfg, tmpcfg + ".tmp"):
+    for p in (tmpcfg, tmpcfg + ".tmp",
+              # 下载器的任务库会落在配置同目录，不清掉会把真实任务
+              # （含本机路径）拍进截图
+              os.path.join(OUT, "downloads.json")):
         if os.path.exists(p):
             os.remove(p)
     cfg = Config(path=tmpcfg)
