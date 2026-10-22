@@ -38,6 +38,14 @@ def wait_port(port, timeout=15.0, host="127.0.0.1"):
     return False
 
 
+def _free_port():
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    p = s.getsockname()[1]
+    s.close()
+    return p
+
+
 def main():
     use_exe = "--exe" in sys.argv
     exe = None
@@ -50,6 +58,21 @@ def main():
     env = dict(os.environ)
     env["APPDATA"] = tmp                      # 隔离配置
     env["LOCALAPPDATA"] = tmp
+    # 单实例也要隔离：用户正开着应用时，探针实例不该被「已在运行」挡掉
+    env["FILESHARE_MUTEX"] = "Local\\FileShare_Smoke_%d" % os.getpid()
+    env["FILESHARE_ACT_PORT"] = str(_free_port())
+
+    # 上一轮（单测/排障）可能已在仓库根留下崩溃日志：先挪开，
+    # 否则这次会把旧账算到本次启动头上
+    stale = os.path.join(ROOT, "FileShare_error.log")
+    if os.path.exists(stale):
+        try:
+            os.rename(stale, stale + ".prev")
+        except OSError:
+            try:
+                os.remove(stale)
+            except OSError:
+                pass
 
     if exe:
         cmd = [exe]

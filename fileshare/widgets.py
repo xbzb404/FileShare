@@ -199,8 +199,62 @@ class ScrollArea(tk.Frame):
         self.bar.bind("<MouseWheel>", self._wheel)
 
     # ---- 滚动 ----
+    def _region_h(self):
+        """当前 scrollregion 的内容高度（0 表示没设置过）。"""
+        sr = self.canvas.cget("scrollregion")
+        if not sr:
+            return 0
+        try:
+            return max(0, int(float(sr.split()[3])))
+        except (ValueError, IndexError):
+            return 0
+
+    def _view_range(self):
+        """(视口高, 内容高, 最大首行比例)。
+
+        内容不满一屏时最大比例为 0.0 —— 此时视图必须钉死在顶部，
+        滚轮、拖动滚动条、恢复滚动比例都不允许把它挪动。
+        """
+        ch = max(1, self.canvas.winfo_height())
+        content = self._region_h()
+        if content <= ch:
+            return ch, content, 0.0
+        return ch, content, (content - ch) / float(content)
+
+    def _clamp_view(self, redraw=True):
+        """把视图钳制在合法范围内；返回是否动过。
+
+        治两类病：
+        1. 内容不满一屏却停在半山腰（跨页恢复比例 / 窗口放大后）；
+        2. 越过内容末端（region 在两次渲染间变短留下的越界滚动态）。
+        """
+        try:
+            _ch, content, max_first = self._view_range()
+            first = self.canvas.yview()[0]
+        except tk.TclError:                 # 窗口正在销毁，没什么可钳的
+            return False
+        if first > max_first + 1e-6 or (max_first <= 0.0 and first != 0.0):
+            try:
+                self.canvas.yview_moveto(max_first)
+            except tk.TclError:
+                return False
+            if redraw:
+                self._draw_bar()
+            return True
+        return False
+
     def _wheel(self, event):
+        try:
+            _ch, content, max_first = self._view_range()
+        except tk.TclError:
+            return
+        if content <= _ch or max_first <= 0.0:
+            # 内容不满一屏：滚轮不该有任何动作。
+            # （用户报告：短页用滚轮能把顶部标题拉到看不见）
+            self._clamp_view()
+            return
         self.canvas.yview_scroll(int(-event.delta / 120) * 3, "units")
+        self._clamp_view()          # 双保险：不许越过内容末端
         self._draw_bar()
 
     def _on_scroll(self, first, last):
@@ -245,24 +299,50 @@ class ScrollArea(tk.Frame):
         if getattr(self, "_drag", None) is None:
             return
         top, bh, ch, content = getattr(self, "_bar_geom", (0, 0, 1, 1))
+        if content <= ch:
+            self._clamp_view()      # 内容不满一屏，拖动也不许滚
+            return
         target = event.y - self._drag[1]
         denom = max(1, ch - bh)
         frac = max(0.0, min(1.0, target / denom))
         self.canvas.yview_moveto(frac * (content - ch) / max(1.0, content))
+        self._clamp_view()
         self._draw_bar()
 
     def refresh(self):
-        self.canvas.update_idletasks()
-        self._draw_bar()
+        try:
+            self.canvas.update_idletasks()
+            self._draw_bar()
+        except tk.TclError:
+            return
+        self._clamp_view()
 
     def reset_top(self):
-        self.canvas.yview_moveto(0)
+        try:
+            self.canvas.yview_moveto(0)
+        except tk.TclError:
+            return
         self.refresh()
+
+    def restore(self, frac):
+        """把视图恢复到 frac（0~1）并钳制到合法范围。
+
+        供页面重绘后恢复滚动位置用；直接 ``yview_moveto`` 在内容变短后
+        可能停在半山腰（标题被拉看不见），必须过一遍钳制。
+        """
+        try:
+            self.canvas.yview_moveto(max(0.0, min(1.0, frac)))
+        except tk.TclError:
+            return
+        self._clamp_view()
 
     def set_scrollregion(self, height):
         self._content_h = int(height)
-        self.canvas.configure(scrollregion=(0, 0, self.canvas.winfo_width(),
-                                            int(height)))
+        try:
+            self.canvas.configure(scrollregion=(
+                0, 0, self.canvas.winfo_width(), int(height)))
+        except tk.TclError:
+            return
         self.refresh()
 
     def bind_wheel_recursive(self, widget):

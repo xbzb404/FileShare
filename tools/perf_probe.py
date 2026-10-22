@@ -9,6 +9,7 @@
 
 import ctypes
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -73,6 +74,13 @@ def main():
     env = dict(os.environ)
     env["APPDATA"] = tmp
     env["LOCALAPPDATA"] = tmp
+    # 单实例隔离：别被用户自己开着的实例挡掉
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    act_port = s.getsockname()[1]
+    s.close()
+    env["FILESHARE_MUTEX"] = "Local\\FileShare_Perf_%d" % os.getpid()
+    env["FILESHARE_ACT_PORT"] = str(act_port)
     t0 = time.time()
     proc = subprocess.Popen([exe], env=env, cwd=ROOT)
 
@@ -80,7 +88,7 @@ def main():
     hwnd = None
     end = time.time() + 30
     while time.time() < end:
-        hwnd, title, vis, pid = find_main()
+        hwnd, title, vis, pid = find_main(exe)
         if hwnd and vis:
             break
         time.sleep(0.3)

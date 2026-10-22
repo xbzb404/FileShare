@@ -1,8 +1,27 @@
 # -*- coding: utf-8 -*-
 """限速与统计：全局限速令牌桶 + 传输速率统计。"""
 
+import os
+import sys
 import threading
 import time
+
+
+def write_crash_log(text):
+    """把异常写进 exe 同目录的 FileShare_error.log。
+
+    windowed 打包没有控制台，异常不落盘就什么线索都没有；
+    写失败（只读目录等）也不能再抛——这是最后一道保险。
+    """
+    try:
+        base = (os.path.dirname(sys.executable)
+                if getattr(sys, "frozen", False)
+                else os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        path = os.path.join(base, "FileShare_error.log")
+        with open(path, "w", encoding="utf-8") as fp:
+            fp.write(text)
+    except Exception:                                       # noqa: BLE001
+        pass
 
 
 class RateLimiter(object):

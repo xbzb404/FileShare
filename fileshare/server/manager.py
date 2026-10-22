@@ -204,12 +204,37 @@ class ShareManager(object):
             return False, msg
         readonly = bool(self.cfg.get("smb", "readonly", default=True))
         done, errors = self.smb.sync(self.shares(), readonly=readonly)
+
+        # 建好共享只是第一步。Win10/11 默认还堵着三道门：没有可用的登录
+        # 账户、防火墙只对「专用网络」放行 445、目录 NTFS 权限不含访问者。
+        # 不把这三件事办掉，共享建得再对，局域网其它机器也是「无法访问」。
+        # 所以启用 SMB 时顺手做一遍（幂等，重复调用没有副作用）。
+        try:
+            fixed, failed = self.smb.repair(self.shares(), readonly=readonly)
+            for f in failed:
+                self.log.add("warn", "SMB 环境修复未完成：%s" % f, "SMB")
+        except Exception as exc:                            # noqa: BLE001
+            self.log.add("warn", "SMB 环境修复异常：%s" % exc, "SMB")
+
         if errors:
             self.last_error["smb"] = "；".join(errors[:2])
             return False, self.last_error["smb"]
         self.last_error.pop("smb", None)
         self.log.add("ok", "SMB 共享已同步（%d 个）" % len(done), "SMB")
         return True, "已同步 %d 个共享" % len(done)
+
+    def smb_diagnose(self):
+        """SMB 能否被局域网其它机器访问的体检结果。"""
+        try:
+            return self.smb.diagnose(self.shares())
+        except Exception as exc:                            # noqa: BLE001
+            self.log.add("err", "SMB 体检失败：%s" % exc, "SMB")
+            return []
+
+    def smb_repair(self):
+        """一键修复：建共享账户 + 放行 445 + 补目录权限。"""
+        readonly = bool(self.cfg.get("smb", "readonly", default=True))
+        return self.smb.repair(self.shares(), readonly=readonly)
 
     def stop_smb(self):
         self.smb.remove_all()
@@ -298,6 +323,8 @@ class ShareManager(object):
             "url": "\\\\%s\\%s" % (ip, sorted(self.smb.managed)[0])
                    if smb_on else "\\\\%s" % ip,
             "error": self.last_error.get("smb", ""),
+            "account": self.smb.account_state()[0],
+            "issues": [],
         }
         st["ip"] = ip
         st["bind_ip"] = bind

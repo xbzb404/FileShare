@@ -749,3 +749,319 @@ class TestDownloader(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestSingleInstance(unittest.TestCase):
+    """单实例守卫：互斥体互斥、TCP 激活、释放、端口被占不误判。"""
+
+    def _make(self, mutex, port):
+        from fileshare.single_instance import SingleInstance
+        return SingleInstance(title="单实例测试窗口", port=port,
+                              mutex_name=mutex)
+
+    def test_mutex_excludes_second(self):
+        mutex = "Local\\FileShare_UT_A_%d" % os.getpid()
+        si1 = self._make(mutex, 0)
+        si2 = self._make(mutex, 0)
+        self.assertTrue(si1.acquire())
+        try:
+            self.assertFalse(si2.acquire())
+        finally:
+            si1.release()
+            si2.release()
+        # 释放后能重新抢到（没有 stale lock）
+        si3 = self._make(mutex, 0)
+        self.assertTrue(si3.acquire())
+        si3.release()
+
+    def test_tcp_activation_end_to_end(self):
+        import threading
+        mutex = "Local\\FileShare_UT_B_%d" % os.getpid()
+        # 端口从「选好」到「bind」之间有窗口期，可能被系统分给别的连接；
+        # 真绑上了就以激活消息为准，没绑上就换下一个端口重试
+        for _ in range(6):
+            port = _free_port()
+            si1 = self._make(mutex, port)
+            fired = threading.Event()
+            self.assertTrue(si1.acquire())
+            si1.activator = lambda: fired.set()
+            bound = si1._srv is not None
+            si2 = self._make(mutex, port)
+            denied = si2.acquire() is False
+            ok = bound and denied and fired.wait(8.0)
+            si1.release()
+            si2.release()
+            if ok:
+                return
+            if not bound:
+                continue                      # 端口被抢，换一个再来
+            self.fail("互斥体已互斥但激活消息没到达（端口 %d）" % port)
+        self.fail("激活通道端口连续被抢，无法完成端到端验证")
+
+    def test_port_stolen_no_false_positive(self):
+        """激活端口被无关程序占用：照常启动、第二个实例仍被拒。"""
+        mutex = "Local\\FileShare_UT_C_%d" % os.getpid()
+        port = _free_port()
+        thief = socket.socket()
+        thief.bind(("127.0.0.1", port))
+        thief.listen(1)
+        try:
+            si1 = self._make(mutex, port)
+            si2 = self._make(mutex, port)
+            self.assertTrue(si1.acquire())
+            self.assertFalse(si2.acquire())
+            si1.release()
+            si2.release()
+        finally:
+            thief.close()
+
+    def test_pending_activation_filled(self):
+        """窗口未就绪时来叫门，activator 设上后要补一次。"""
+        import threading
+        mutex = "Local\\FileShare_UT_D_%d" % os.getpid()
+        for _ in range(6):
+            port = _free_port()
+            si1 = self._make(mutex, port)
+            fired = threading.Event()
+            self.assertTrue(si1.acquire())
+            if si1._srv is None:
+                si1.release()
+                continue                      # 端口被抢，换一个再来
+            try:
+                si2 = self._make(mutex, port)  # 此刻 activator=None → 待机
+                self.assertFalse(si2.acquire())
+                time.sleep(0.2)
+                si1.activator = lambda: fired.set()
+                if fired.wait(5.0):
+                    return
+                self.fail("待机的叫门没有被补齐（端口 %d）" % port)
+            finally:
+                si1.release()
+                si2.release()
+        self.fail("激活通道端口连续被抢，无法完成待机补齐验证")
+
+
+def _free_port():
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    p = s.getsockname()[1]
+    s.close()
+    return p
+
+
+class TestUiCallbackHardening(unittest.TestCase):
+    """UI 健壮性：Tk 回调异常不能把程序带走；控件销毁后同步要安静跳过。
+
+    对应踩过的坑：windowed 打包没有 stderr，Tk 默认的
+    report_callback_exception 写 traceback 会 OSError[Errno 22]，
+    整个程序当场消失。
+    """
+
+    def setUp(self):
+        try:
+            import tkinter as tk          # noqa: F401
+        except ImportError:
+            self.skipTest("环境没有 tkinter")
+        self.tmp = tempfile.mkdtemp(prefix="fs_ui_")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _app(self):
+        from fileshare.config import Config
+        from fileshare.ui.app import App
+        cfg = Config(path=os.path.join(self.tmp, "config.json"))
+        cfg.data["http"]["enabled"] = False
+        cfg.data["ftp"]["enabled"] = False
+        cfg.data["smb"]["enabled"] = False
+        cfg.data["shares"] = []
+        cfg.data["download"]["dir"] = self.tmp
+        return App(cfg)
+
+    def test_callback_exception_is_contained(self):
+        app = self._app()
+        # 故意触发的异常不该把崩溃日志写进仓库根（会污染冒烟测试的
+        # FileShare_error.log 检查）——落盘行为单测里 Patch 掉
+        import fileshare.ui.app as app_mod
+        old = app_mod.write_crash_log
+        app_mod.write_crash_log = lambda text: None
+        try:
+            root = app.root
+            root.update()
+
+            def boom():
+                raise RuntimeError("探针故意抛的异常")
+
+            root.after(10, boom)
+            for _ in range(6):
+                root.update()
+                time.sleep(0.05)
+            # 程序还活着：还能切页、还能重建
+            app.show_page("shares")
+            root.update()
+            self.assertTrue(root.winfo_exists(), "回调异常把程序带走了")
+            tail = " ".join(t[2] for t in app.log.tail(30))
+            self.assertIn("界面回调异常", tail, "异常没有进事件日志")
+        finally:
+            app_mod.write_crash_log = old
+            app._quit()
+
+    def test_sync_log_after_widget_destroyed(self):
+        app = self._app()
+        try:
+            app.show_page("logs")
+            app.root.update()
+            app.logtext.destroy()               # 模拟主题切换/退出重建
+            app.root.update()
+            app._sync_log(force=True)           # 不能抛
+            app.log.add("info", "控件没了也再来一条", "T")
+            app._sync_log(force=True)           # 也不能抛
+        finally:
+            app._quit()
+
+
+class TestSmbDiagnose(unittest.TestCase):
+    """SMB「局域网连不上」的体检逻辑：解析、判定、修复动作。
+
+    这些用例全部在纯逻辑层验证（不打真实系统命令），因为它们要跑在
+    任何机器上：真正改防火墙/建账户的动作只在用户点「修复」时发生。
+    """
+
+    def _mgr(self, run_reply=None, ps_reply=None):
+        """造一个把系统命令全部替换成固定回复的 SmbManager。"""
+        from fileshare.server.smb import SmbManager
+        m = SmbManager()
+        self.calls = []
+
+        def fake_run(args, timeout=20):
+            self.calls.append(list(args))
+            if run_reply is None:
+                return 1, ""
+            return run_reply(args)
+
+        def fake_ps(script, timeout=30):
+            self.calls.append(["PS", script[:40]])
+            if ps_reply is None:
+                return 1, ""
+            return ps_reply(script)
+
+        m._run = fake_run
+        m._ps = fake_ps
+        return m
+
+    def test_acl_parse_skips_path_token(self):
+        """icacls 输出首行带路径，不能把盘符 E 当成账户名。"""
+        m = self._mgr(run_reply=lambda a: (0, (
+            "E:\\Fshare BUILTIN\\Administrators:(I)(F)\n"
+            "           NT AUTHORITY\\Authenticated Users:(I)(M)\n"
+            "           BUILTIN\\Users:(I)(RX)\n")))
+        who = m._acl_grants("E:\\Fshare")
+        # 身份统一成小写 + 正斜杠，方便跨语言/跨分隔符比较
+        self.assertIn("builtin/administrators", who)
+        self.assertIn("nt authority/authenticated users", who)
+        self.assertNotIn("e", who)
+        self.assertNotIn("fshare", who)
+
+    def test_ntfs_allows_detects_everyone_by_sid(self):
+        m = self._mgr(run_reply=lambda a: (0, (
+            "E:\\s *S-1-1-0:(I)(OI)(CI)(RX)\n")))
+        self.assertTrue(m._ntfs_allows("E:\\s"))
+
+    def test_ntfs_allows_account_name(self):
+        m = self._mgr(run_reply=lambda a: (0, (
+            "E:\\s BUILTIN\\Users:(I)(RX)\n"
+            "           FileShare:(OI)(CI)(RX)\n")))
+        self.assertTrue(m._ntfs_allows("E:\\s", "FileShare"))
+        # 没授权 FileShare 时要判定为不允许（共享权限给了 Everyone 也没用）
+        m2 = self._mgr(run_reply=lambda a: (0, (
+            "E:\\s BUILTIN\\Users:(I)(RX)\n")))
+        self.assertFalse(m2._ntfs_allows("E:\\s", "FileShare"))
+
+    def test_diagnose_reports_firewall_and_account(self):
+        """防火墙关闭 + 没有账户 → 两条 error。"""
+        def run(args):
+            joined = " ".join(args)
+            if "netstat" in joined:
+                return 0, "  TCP    0.0.0.0:445    0.0.0.0:0    LISTENING    4"
+            if args[:2] == ["net", "user"] and len(args) > 2:
+                return 2, "找不到用户名。"
+            if args[0] == "icacls":
+                return 0, "E:\\s BUILTIN\\Users:(I)(RX)\n"
+            return 1, ""
+
+        m = self._mgr(run_reply=run,
+                      ps_reply=lambda s: (0, "CLOSED"))
+        import tempfile
+        d = tempfile.mkdtemp(prefix="fs_smb_")
+        try:
+            issues = m.diagnose([{"name": "s", "path": d}])
+            keys = {i["key"] for i in issues}
+            self.assertIn("firewall", keys)
+            self.assertIn("account", keys)
+            self.assertIn("ntfs", keys)
+            # 三个都可修
+            self.assertTrue(all(i["fixable"] for i in issues
+                                if i["key"] in ("firewall", "account", "ntfs")))
+        finally:
+            import shutil
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_diagnose_clean_when_everything_ok(self):
+        """全部达标时不应该报任何 error。"""
+        import tempfile
+        d = tempfile.mkdtemp(prefix="fs_smb_ok_")
+
+        def run(args):
+            joined = " ".join(args)
+            if "netstat" in joined:
+                return 0, "  TCP    0.0.0.0:445    0.0.0.0:0    LISTENING    4"
+            if args[:2] == ["net", "user"] and len(args) > 2:
+                return 0, "帐户启用    Yes"
+            if args[0] == "icacls":
+                # 用真实目录路径，模拟 icacls 真实输出格式
+                return 0, "%s *S-1-1-0:(I)(RX)\n" % d
+            return 1, ""
+
+        m = self._mgr(run_reply=run,
+                      ps_reply=lambda s: (0, "OPEN:文件和打印机共享(SMB-In)"))
+        try:
+            issues = m.diagnose([{"name": "s", "path": d}])
+            errs = [i for i in issues if i["level"] == "error"]
+            self.assertEqual([], errs, "不该报错：%s" % errs)
+        finally:
+            import shutil
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_firewall_state_open(self):
+        """有覆盖当前网络的规则 → 判定已放行。"""
+        m = self._mgr(ps_reply=lambda s: (0, "OPEN:文件和打印机共享(SMB-In)"))
+        ok, why = m.firewall_state()
+        self.assertTrue(ok)
+        self.assertIn("放行", why)
+
+    def test_firewall_state_closed(self):
+        """没有覆盖当前网络的 445 规则 → 判定未放行。"""
+        m = self._mgr(ps_reply=lambda s: (0, "CLOSED"))
+        ok, why = m.firewall_state()
+        self.assertFalse(ok)
+        self.assertIn("445", why)
+
+    def test_firewall_falls_back_to_netsh(self):
+        """PowerShell 被禁（rc!=0）时退回 netsh 粗查。"""
+        def run(args):
+            if args[:1] == ["netsh"]:
+                return 0, "规则名称: FileShare SMB (TCP 445)\n本地端口: 445\n操作: 允许"
+            return 1, ""
+        m = self._mgr(run_reply=run, ps_reply=lambda s: (1, ""))
+        ok, why = m.firewall_state()
+        self.assertTrue(ok, why)
+
+    def test_repair_requires_admin(self):
+        """非管理员时修复要说清楚原因，不能静默失败。"""
+        from fileshare.server.smb import SmbManager
+        m = SmbManager()
+        m.available = lambda: (False, "需要管理员权限")
+        done, failed = m.repair([])
+        self.assertEqual([], done)
+        self.assertTrue(any("管理员" in f for f in failed))

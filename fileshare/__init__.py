@@ -13,4 +13,9 @@ AUTHOR = "by zhb"
 AUTHOR_TAG = "zhb"
 APP_NAME = "文件共享中心"
 APP_SUB = "局域网文件共享 · HTTP / FTP / SMB"
-__version__ = "1.0.0"
+__version__ = "1.1.0"
+
+
+def window_title():
+    """主窗口标题。单实例守卫要靠它按标题找窗口，必须只有这一处拼装。"""
+    return "%s v%s · %s" % (APP_NAME, __version__, AUTHOR)

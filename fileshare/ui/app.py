@@ -18,7 +18,7 @@ import tkinter.font as tkfont
 import tkinter.ttk as ttk
 from tkinter import filedialog
 
-from .. import AUTHOR, APP_NAME, APP_SUB, __version__
+from .. import AUTHOR, APP_NAME, APP_SUB, __version__, window_title
 from .. import theme as T
 from ..config import Config
 from ..download.engine import Downloader
@@ -28,7 +28,7 @@ from ..netutil import (adapter_by_ip, is_admin, link_speed, listen_choices,
 from ..server.manager import ShareManager
 from ..tray import TrayIcon, available as tray_available
 from ..util import (EventLog, human_bytes, human_link, human_speed,
-                    human_time)
+                    human_time, write_crash_log)
 from ..widgets import (LineEntry, NavItem, Painter, PillButton, ScrollArea,
                       Slider, Sparkline, Switch, action_at)
 
@@ -84,13 +84,16 @@ class App(object):
         self._log_seq = -1
         self._dl_version = 0
         self._dl_seen = -1
+        self._smb_issues = None             # SMB 体检结果缓存（None = 未查）
+        self._smb_busy = False
+        self._smb_fixing = False
         self._dirty = True
         self._notice = ""
         self._notice_until = 0
 
         T.init_scaling()
         self.root = tk.Tk()
-        self.root.title("%s v%s · %s" % (APP_NAME, __version__, AUTHOR))
+        self.root.title(window_title())
         self.root.configure(bg=self.theme["bg"])
         self.fonts = T.Fonts(self.root)
         self._set_window_geometry()
@@ -99,6 +102,7 @@ class App(object):
         self._bind_events()
 
         self.tray = None
+        self.single_instance = None       # main.py 里装配；退出时要还锁
         if tray_available():
             self._make_tray()
         if start_hidden and self.tray is not None:
@@ -285,6 +289,20 @@ class App(object):
         self.root.bind("<Map>", lambda e: None)
         for seq in ("<Control-q>",):
             self.root.bind(seq, lambda e: self._quit())
+        # Tk 回调里漏网的异常：默认处理器往 stderr 写 traceback，
+        # windowed 打包没有 stderr → OSError [Errno 22] 直接把进程带走
+        # （踩过：一次 _sync_log 的 TclError 让整个程序当场消失）。
+        # 改成写日志 + 落盘，界面保住。
+        self.root.report_callback_exception = self._report_callback_exception
+
+    def _report_callback_exception(self, exc, val, tb):
+        import traceback as _tb
+        text = "".join(_tb.format_exception(exc, val, tb)).strip()
+        try:
+            self.log.add("err", "界面回调异常：%s" % (val or exc), "系统")
+        except Exception:                                   # noqa: BLE001
+            pass
+        write_crash_log(text)
 
     # ------------------------------------------------------------ 页面
     def show_page(self, key):
@@ -295,12 +313,13 @@ class App(object):
         for k, item in self.nav_items.items():
             item.set_selected(k == key)
         self._sync_header_buttons()
-        self.render_page()
+        # 切页一律回顶：不把上一页的滚动比例带到新页
+        self.render_page(keep_scroll=False)
         if first_visit:
             # 切回「共享网络」页就主动扫一次（后台线程，界面无感）
             self._start_peer_scan(manual=False)
 
-    def render_page(self):
+    def render_page(self, keep_scroll=True):
         if self.page == "logs":
             self.scroll.pack_forget()
             self.logview.pack(fill="both", expand=True)
@@ -316,7 +335,10 @@ class App(object):
         snap = self._snapshot_entry_focus()
 
         c = self.scroll.canvas
-        pos = c.yview()[0]
+        # keep_scroll=False（切页）时回顶：滚动比例是「当前页内容」的比例，
+        # 直接带给下一页会把短页也挪到半山腰，标题被拉得看不见
+        # （用户报告的滚轮 bug 的一半根源）。
+        pos = c.yview()[0] if keep_scroll else 0.0
         for w in self._embedded:
             try:
                 w.destroy()
@@ -340,7 +362,7 @@ class App(object):
                 p.body("页面渲染出错：%s" % exc, color=self.theme["status_bad"])
         p.gap(24)
         self.scroll.set_scrollregion(p.y)
-        c.yview_moveto(pos)
+        self.scroll.restore(pos)
         self._restore_entry_focus(snap)
 
     # ---- 输入焦点保护（配合 render_page 的销毁重建） ----
@@ -948,19 +970,20 @@ class App(object):
 
     def _smb_settings(self, p, st):
         t = self.theme
+        f = self.fonts
         admin = st["admin"]
 
         def draw():
             p.gap(2)
-            sw = Switch(p.c, self.fonts, t, value=st["smb"]["on"],
+            sw = Switch(p.c, f, t, value=st["smb"]["on"],
                         command=lambda v: self._toggle_proto("smb", v))
             p.c.create_window(p.x, p.y, window=sw, anchor="nw")
             self._embedded.append(sw)
             p.c.create_text(p.x + T.px(56), p.y + T.px(3),
                             text="创建同名 Windows 共享（\\\\本机IP\\共享名）",
-                            anchor="nw", font=self.fonts.body, fill=t["tx"])
+                            anchor="nw", font=f.body, fill=t["tx"])
             p.y += T.px(34)
-            sw2 = Switch(p.c, self.fonts, t,
+            sw2 = Switch(p.c, f, t,
                          value=bool(self.cfg.get("smb", "readonly", default=True)),
                          command=lambda v: self._set_bool("smb", "readonly", v,
                                                           restart=True))
@@ -968,20 +991,75 @@ class App(object):
             self._embedded.append(sw2)
             p.c.create_text(p.x + T.px(56), p.y + T.px(3),
                             text="只读（关掉后局域网可写入）", anchor="nw",
-                            font=self.fonts.body, fill=t["tx"])
+                            font=f.body, fill=t["tx"])
             p.y += T.px(36)
             if not admin:
                 p.body("当前不是管理员：SMB 共享需要管理员权限，"
-                       "点左侧「以管理员重启」。", color=t["status_warn"],
-                       font=self.fonts.small)
+                       "点右上角「以管理员身份重启」。", color=t["status_warn"],
+                       font=f.small)
             elif st["smb"]["on"]:
                 p.mono_text(st["smb"]["url"], color=t["accent"])
+                acct = st["smb"].get("account") or ""
+                if acct and acct != "Guest":
+                    p.body("局域网其它机器访问时，用户名 %s，密码 %s"
+                           % (acct, "fileshare"), color=t["tx2"], font=f.small)
+                elif acct == "Guest":
+                    p.body("当前靠 Guest 来宾账户访问 —— 多数系统默认禁用来宾，"
+                           "连不上请点下方「修复局域网访问」。",
+                           color=t["status_warn"], font=f.small)
+                else:
+                    p.body("没有任何可用的登录账户：别的机器连过来会直接报"
+                           "「无法访问」。点下方「修复局域网访问」。",
+                           color=t["status_warn"], font=f.small)
             if st["smb"].get("error"):
-                p.body(st["smb"]["error"], color=t["status_warn"],
-                       font=self.fonts.tiny)
-            p.gap(2)
+                p.body(st["smb"]["error"], color=t["status_warn"], font=f.tiny)
+
+            # ---- 局域网访问体检 ----
+            self._smb_check()
+            issues = self._smb_issues
+            if issues is None:
+                p.gap(6)
+                p.body("正在检查局域网访问条件…", color=t["tx3"], font=f.tiny)
+            elif not issues:
+                p.gap(6)
+                p.body("✓ 局域网访问条件正常：其它机器可以直接打开上面的地址。",
+                       color=t["status_ok"], font=f.small)
+            else:
+                p.gap(8)
+                errs = [i for i in issues if i["level"] == "error"]
+                warns = [i for i in issues if i["level"] != "error"]
+                p.body("发现 %d 个问题（%d 个会导致完全连不上）"
+                       % (len(issues), len(errs)), color=t["status_warn"],
+                       font=f.small)
+                for it in issues:
+                    col = (t["status_bad"] if it["level"] == "error"
+                           else t["status_warn"])
+                    p.c.create_text(p.x, p.y, text="· " + it["title"], anchor="nw",
+                                    font=f.small, fill=col,
+                                    width=p.w - T.px(80))
+                    p.y += T.px(20)
+                    if it.get("detail"):
+                        p.c.create_text(p.x + T.px(12), p.y, text=it["detail"],
+                                        anchor="nw", font=f.tiny, fill=t["tx3"],
+                                        width=p.w - T.px(96))
+                        p.y += T.px(18) * max(1, 1 + len(it["detail"]) // 46)
+                if any(i.get("fixable") for i in issues):
+                    bh = T.px(32)
+                    p.button(p.x, p.y + T.px(4), T.px(160), bh,
+                             "修复局域网访问", self._smb_repair, "primary",
+                             font=f.small)
+                    p.y += bh + T.px(12)
+                    p.c.create_text(
+                        p.x, p.y,
+                        text="修复会：创建专用共享账户（FileShare / fileshare）、"
+                             "放行 TCP 445、给共享目录补读权限。只动局域网共享"
+                             "相关设置，不改其它系统配置。",
+                        anchor="nw", font=f.tiny, fill=t["tx3"],
+                        width=p.w - T.px(20))
+                    p.y += T.px(16) * 2
+            p.gap(4)
             p.body("Windows 自带的 SMB 是内核态实现，局域网大文件传输比 HTTP 还快，"
-                   "适合当网盘用。", color=t["tx3"], font=self.fonts.tiny)
+                   "适合当网盘用。", color=t["tx3"], font=f.tiny)
         p.card(draw, pad=16)
 
     def _nic_label(self):
@@ -1544,6 +1622,14 @@ class App(object):
         if not force and seq == self._log_seq:
             return
         txt = self.logtext
+        # 主题切换 / 退出重建时控件可能已被销毁：TclError 直接跳过，
+        # 别让一次同步失败顺着 Tk 回调把整个程序带走
+        try:
+            alive = bool(txt.winfo_exists())
+        except tk.TclError:
+            return
+        if not alive:
+            return
         fresh = seq - self._log_seq if self._log_seq >= 0 else 0
         count = getattr(self, "_log_count", 0)
         rebuild = force or fresh <= 0 or fresh > 200 or count > 900
@@ -1609,6 +1695,52 @@ class App(object):
         # 忙标志由 _pump 清除，这里只是触发一次重绘
         if self.page in ("overview", "servers"):
             self.render_page()
+
+    # ---- SMB 局域网访问体检 / 修复 ----
+    def _smb_check(self, force=False):
+        """后台跑一次 SMB 体检，结果缓存起来供渲染读取。
+
+        诊断要调 netsh/netstat/powershell，一次几十到上百毫秒，
+        不能放在渲染路径上同步做，否则每次重绘都卡一下。
+        """
+        if getattr(self, "_smb_busy", False):
+            return
+        if not force and self._smb_issues is not None:
+            return
+        self._smb_busy = True
+
+        def work():
+            try:
+                issues = self.manager.smb_diagnose()
+            except Exception:                               # noqa: BLE001
+                issues = []
+            self._q.put(("smb-issues", issues))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _smb_repair(self):
+        """一键修复 SMB：建共享账户、放行 445、补目录权限。"""
+        if getattr(self, "_smb_fixing", False):
+            return
+        if not self.manager.status()["admin"]:
+            self._toast("需要管理员权限，点右上角「以管理员身份重启」")
+            return
+        self._smb_fixing = True
+        self._toast("SMB 修复中…")
+
+        def work():
+            try:
+                done, failed = self.manager.smb_repair()
+            except Exception as exc:                        # noqa: BLE001
+                done, failed = [], [str(exc)]
+            self._q.put(("smb-repair", done, failed))
+
+        threading.Thread(target=work, daemon=True).start()
+        self.root.after(500, self._wait_repair)
+
+    def _wait_repair(self):
+        if getattr(self, "_smb_fixing", False):
+            self.root.after(400, self._wait_repair)
 
     def _toggle_services(self):
         """顶栏（非下载页）：一键启停全部服务。"""
@@ -2079,8 +2211,47 @@ class App(object):
             self.root.state("normal")
             self.root.lift()
             self.root.focus_force()
+            self._raise_foreground()
         except tk.TclError:
             pass
+
+    def _raise_foreground(self):
+        """Win32 置前台。
+
+        Tk 的 ``lift()``/``focus_force()`` 在「前台属于别的进程」时不灵
+        （Windows 只允许前台进程改前台）。先挂到当前前台线程的输入队列，
+        再 SetForegroundWindow，设完摘掉 —— 单实例激活、托盘双击都用它。
+        """
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+            user32 = ctypes.windll.user32
+            hwnd = ctypes.c_void_p(self.root.winfo_id())
+            user32.GetWindowThreadProcessId.argtypes = [
+                ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
+            user32.GetWindowThreadProcessId.restype = ctypes.c_ulong
+            pid = ctypes.c_ulong(0)
+            tid_cur = user32.GetWindowThreadProcessId(
+                user32.GetForegroundWindow(), ctypes.byref(pid))
+            tid_me = ctypes.windll.kernel32.GetCurrentThreadId()
+            attached = False
+            if tid_cur and tid_cur != tid_me:
+                attached = bool(user32.AttachThreadInput(tid_me, tid_cur,
+                                                          True))
+            user32.BringWindowToTop(hwnd)
+            user32.SetForegroundWindow(hwnd)
+            if attached:
+                user32.AttachThreadInput(tid_me, tid_cur, False)
+        except Exception:                                   # noqa: BLE001
+            pass
+
+    def activation_handler(self):
+        """第二个实例启动时的「叫门」回调（跑在激活通道的线程里）。
+
+        只负责往 Tk 消息队列塞一句话，真正的显示动作回到 UI 线程做。
+        """
+        self._q.put(("activate", None))
 
     def _on_minimize(self, event=None):
         if self._min_guard or self._closing:
@@ -2190,6 +2361,13 @@ class App(object):
                     self.root.after_cancel(job)
                 except tk.TclError:
                     pass
+        # 单实例：先关激活通道再停服务（不然第二个实例来叫门没人应答）
+        si = self.single_instance
+        if si is not None:
+            try:
+                si.release()
+            except Exception:                               # noqa: BLE001
+                pass
         try:
             self.cfg.save()
             self.downloader.stop_all()
@@ -2314,6 +2492,27 @@ class App(object):
             self._toast(("✓ " if ok else "✗ ") + (text or ""))
             self.render_page()
             self._refresh_all_button()
+        elif kind == "activate":
+            # 第二个实例来叫门：把本窗口提到前台
+            self._show_window()
+            self._toast("已在运行，已为你打开窗口")
+        elif kind == "smb-repair":
+            _k, done, failed = msg
+            self._smb_fixing = False
+            if failed:
+                self._toast("SMB 修复完成 %d 项，%d 项失败" % (len(done),
+                                                              len(failed)))
+            else:
+                self._toast("SMB 修复完成：%d 项全部成功" % len(done))
+            self._smb_issues = None        # 让界面重查一次
+            self.render_page()
+        elif kind == "smb-issues":
+            _k, issues = msg
+            self._smb_busy = False
+            self._smb_issues = issues
+            # 只在设置页才需要立刻把结果画出来
+            if self.page == "servers":
+                self.render_page()
 
     def _tick(self):
         if self._closing:

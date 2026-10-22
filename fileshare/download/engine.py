@@ -378,6 +378,13 @@ class Downloader(object):
         return True
 
     def stop_all(self):
+        """优雅停掉全部下载：停线程、落盘断点，不等也绝不拖残留。
+
+        ``_stop_all`` 一置，监视循环退出；每个任务的 ``_stop`` 一置，
+        分段线程写完当前块就收工。join 设了 2 秒上限——真有网络卡住的
+        连接也不陪葬（线程都是 daemon，进程照样能退）。
+        """
+        self._stop_all.set()
         for t in self.tasks:
             if t.status in ("running", "connecting"):
                 t._stop.set()
@@ -385,6 +392,13 @@ class Downloader(object):
         for t in self.tasks:
             self._save_meta(t)
         self._save_store()
+        deadline = time.time() + 2.0
+        for t in self.tasks:
+            for w in list(getattr(t, "_workers", []) or []):
+                w.join(max(0.0, deadline - time.time()))
+        mon, self._monitor = self._monitor, None
+        if mon is not None and mon.is_alive():
+            mon.join(0.3)
 
     # ------------------------------------------------------------ 主流程
     def _run_task(self, task):

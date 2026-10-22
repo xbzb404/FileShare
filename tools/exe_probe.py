@@ -9,6 +9,7 @@ onefile 的 exe 是「引导器 → 子进程」，窗口属于子进程，所�
 
 import ctypes
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -41,11 +42,34 @@ def enum_top():
     return out
 
 
-def find_main():
-    """Tk 会额外建一个同标题的隐藏「icon window」，必须挑可见的那个。"""
+def image_name(pid):
+    """取进程镜像文件名（小写）；失败返回 None。"""
+    h = kernel32.OpenProcess(0x1000, False, pid)   # QUERY_LIMITED_INFORMATION
+    if not h:
+        return None
+    try:
+        buf = ctypes.create_unicode_buffer(1024)
+        size = wintypes.DWORD(1024)
+        if not kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+            return None
+        return os.path.basename(buf.value).lower()
+    finally:
+        kernel32.CloseHandle(ctypes.c_void_p(h))
+
+
+def find_main(exe_path=None):
+    """Tk 会额外建一个同标题的隐藏「icon window」，必须挑可见的那个。
+
+    ``exe_path`` 给了就按进程镜像名过滤：否则可能命中**用户自己开着的
+    同名窗口**或并行探针拉起的实例（实测踩过——量到别人 pid 上，
+    对方一退出 OpenProcess 就失败，CPU/内存全读成 None）。
+    """
     fallback = None
+    want = os.path.basename(exe_path).lower() if exe_path else None
     for hwnd, title, vis, pid in enum_top():
         if "文件共享中心" not in title:
+            continue
+        if want and image_name(pid) != want:
             continue
         if vis:
             return hwnd, title, vis, pid
@@ -104,6 +128,13 @@ def main():
     env = dict(os.environ)
     env["APPDATA"] = tmp
     env["LOCALAPPDATA"] = tmp
+    # 单实例隔离：别被用户自己开着的实例挡掉，也别去激活用户的窗口
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    act_port = s.getsockname()[1]
+    s.close()
+    env["FILESHARE_MUTEX"] = "Local\\FileShare_ExeProbe_%d" % os.getpid()
+    env["FILESHARE_ACT_PORT"] = str(act_port)
     print("启动", exe)
     proc = subprocess.Popen([exe], env=env, cwd=ROOT)
     ok = True
@@ -111,7 +142,7 @@ def main():
     try:
         end = time.time() + 30
         while time.time() < end:
-            hwnd, title, vis, _pid = find_main()
+            hwnd, title, vis, _pid = find_main(exe)
             if hwnd and vis:
                 break
             time.sleep(0.4)

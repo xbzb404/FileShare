@@ -8,9 +8,9 @@ token 的取用顺序（先命中的赢）：
   4. ``git credential fill``（HTTPS 凭据管理器里存过 token 时）
 
 用法：
-    python tools/publish_release.py --repo xbzb404/FileShare --tag v1.0.0 \\
-        --notes docs/release_v1.0.0.md --asset dist/FileShare.exe
-    python tools/publish_release.py --repo xbzb404/FileShare --tag v1.0.0 \\
+    python tools/publish_release.py --repo xbzb404/FileShare --tag v1.1.0 \\
+        --notes docs/release_v1.1.0.md --asset dist/FileShare.exe
+    python tools/publish_release.py --repo xbzb404/FileShare --tag v1.1.0 \\
         --asset dist/FileShare.exe --dry-run
 
 要点（踩过的坑）：
