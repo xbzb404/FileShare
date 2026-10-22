@@ -55,7 +55,7 @@ def build(mode):
 print("== 账号模式 ==")
 app_a, cfg_a, n_acc, text_a = build("account")
 print("  输入框数量:", n_acc)
-check("面板有免密开关", "免密只读" in text_a)
+check("面板不再有免密开关", "免密只读" not in text_a)
 check("面板有 SMB 密码复杂度提示", "密码需满足系统复杂度" in text_a)
 
 app_a._set_smb_cred("password", "MyNewPass@2026")
@@ -67,16 +67,9 @@ app_a._set_smb_cred("user", "bad name")
 check("带空格用户名被拒绝", cfg_a.get("smb", "user") == "MyShare")
 app_a._quit()
 
-print("\n== 免密模式 ==")
-app_b, cfg_b, n_ev, text_b = build("everyone")
-print("  输入框数量:", n_ev)
-check("免密模式比账号模式少 2 个输入框（用户名+密码）",
-      n_acc - n_ev == 2, "%d vs %d" % (n_acc, n_ev))
-check("免密模式没有密码复杂度提示", "密码需满足系统复杂度" not in text_b)
-check("免密开关标注 Everyone 权限", "Everyone 权限" in text_b)
-app_b._set_smb_mode(False)
-check("面板内切回账号模式", cfg_b.get("smb", "mode") == "account")
-app_b._quit()
+print("\n== 只保留指定账户 ==")
+check("面板写明只能用这个账户", "只能用这个账户访问" in text_a)
+check("用户名改动已生效", (cfg_a.get("smb", "user") or "") == "MyShare")
 
 print("\n%s" % ("SMB 控件行为 PASS" if not FAIL else "FAIL: %s" % FAIL))
 sys.exit(0 if not FAIL else 1)

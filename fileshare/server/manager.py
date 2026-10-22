@@ -168,12 +168,16 @@ class ShareManager(object):
                 self.last_error["ftp"] = msg
                 self.log.add("err", "FTP 启动失败：" + msg, "FTP")
                 return False, msg
+            anon = bool(self.cfg.get("ftp", "anonymous"))
             srv = FtpServer(
                 self.shares, port=port,
                 user=self.cfg.get("ftp", "user") or "share",
                 password=self.cfg.get("ftp", "password") or "",
-                anonymous=bool(self.cfg.get("ftp", "anonymous")),
-                allow_upload=bool(self.cfg.get("ftp", "upload", default=False)),
+                anonymous=anon,
+                # 匿名会话固定只读：谁都能进的情况下再允许上传，
+                # 等于把共享目录开放给整个局域网任意写入
+                allow_upload=(bool(self.cfg.get("ftp", "upload", default=False))
+                              and not anon),
                 limiter=self.up_limiter, stats=self.stats, log=self.log,
                 traffic=self.traffic, host=host)
             ok, msg = srv.start()
@@ -197,10 +201,6 @@ class ShareManager(object):
             return True, "已停止"
 
     # ------------------------------------------------------------ SMB
-    def _smb_mode(self):
-        mode = (self.cfg.get("smb", "mode") or "everyone").strip().lower()
-        return mode if mode in ("everyone", "account") else "everyone"
-
     def _smb_cred(self):
         """账号模式的用户名/密码（界面可改）。"""
         user = (self.cfg.get("smb", "user") or "FileShare").strip() or "FileShare"
@@ -208,7 +208,7 @@ class ShareManager(object):
         if not pwd:
             # 空密码在「账号模式」下必然连不上（系统禁止空密码网络登录），
             # 用与建账户时一致的默认值，避免「账户密码」和界面显示对不上
-            pwd = smb.SHARE_PASS
+            pwd = smb.SHARE_PW
         return user, pwd
 
     def sync_smb(self):
@@ -217,17 +217,24 @@ class ShareManager(object):
             self.last_error["smb"] = msg
             return False, msg
 
-        # 免密模式在这台机器上被安全策略堵死（Guest 禁止从网络登录）时，
-        # 自动切到账号模式：否则用户开着共享却永远连不上，还得自己猜原因。
-        if self._smb_mode() == "everyone":
-            guest_ok, why = self.smb.guest_state()
-            if not guest_ok and "1385" in (why or ""):
-                self.cfg.set("account", "smb", "mode")
-                self.cfg.save()
-                self.log.add("warn", "这台机器禁止 Guest 从网络登录，"
-                                     "免密模式不可用，已自动切换为账号模式", "SMB")
         readonly = bool(self.cfg.get("smb", "readonly", default=True))
-        done, errors = self.smb.sync(self.shares(), readonly=readonly)
+        user, _pwd = self._smb_cred()
+
+        # 迁移：老版本有「免密」模式，会把目录授予 Everyone。现在只认指定
+        # 账户，所以开共享时先把那些 Everyone 显式 ACE 收回来（继承来的不动）。
+        try:
+            dropped, dfail = self.smb.drop_legacy_everyone(
+                [s["path"] for s in self.shares()])
+            if dropped:
+                self.log.add("info", "已收回 %d 处旧的 Everyone 目录授权"
+                             % len(dropped), "SMB")
+            for f in dfail:
+                self.log.add("warn", "收回 Everyone 授权失败：%s" % f, "SMB")
+        except Exception as exc:                            # noqa: BLE001
+            self.log.add("warn", "收回 Everyone 授权异常：%s" % exc, "SMB")
+
+        done, errors = self.smb.sync(self.shares(), readonly=readonly,
+                                     account=user)
 
         # 建好共享只是第一步。Win10/11 默认还堵着三道门：没有可用的登录
         # 账户、防火墙只对「专用网络」放行 445、目录 NTFS 权限不含访问者。
@@ -256,26 +263,22 @@ class ShareManager(object):
         """SMB 能否被局域网其它机器访问的体检结果。"""
         try:
             user, pwd = self._smb_cred()
-            return self.smb.diagnose(self.shares(), mode=self._smb_mode(),
-                                     user=user, password=pwd)
+            return self.smb.diagnose(self.shares(), user=user, password=pwd)
         except Exception as exc:                            # noqa: BLE001
             self.log.add("err", "SMB 体检失败：%s" % exc, "SMB")
             return []
 
     def smb_repair(self):
-        """一键修复：按当前模式开通访问 + 放行 445 + 补目录权限。"""
+        """一键修复：建账户并加固 + 放行 445 + 补目录权限。"""
         readonly = bool(self.cfg.get("smb", "readonly", default=True))
         user, pwd = self._smb_cred()
         return self.smb.repair(self.shares(), readonly=readonly,
-                               mode=self._smb_mode(), user=user, password=pwd)
+                               user=user, password=pwd)
 
     def stop_smb(self):
         """取消共享：删共享 + 把加过的目录权限还原。"""
-        # 按当前模式算出「我们授过谁」，记录丢了也能兜底撤销
-        if self._smb_mode() == "everyone":
-            principals = ["Everyone"]
-        else:
-            principals = [self._smb_cred()[0]]
+        # 我们授过的身份：指定账户 + 老版本可能授过的 Everyone（迁移遗留）
+        principals = [self._smb_cred()[0]]
         removed, failed = self.smb.remove_all(
             restore=True, principals=principals,
             paths=[s["path"] for s in self.shares()])
@@ -332,9 +335,8 @@ class ShareManager(object):
             except Exception:                              # noqa: BLE001
                 pass
         try:
-            # 退出也要还原权限：共享都没了还留着 Everyone 读写等于开后门
-            principals = (["Everyone"] if self._smb_mode() == "everyone"
-                          else [self._smb_cred()[0]])
+            # 退出也要还原权限：共享都没了还留着读写授权等于开后门
+            principals = [self._smb_cred()[0]]
             self.smb.remove_all(
                 restore=True, principals=principals,
                 paths=[s["path"] for s in self.shares()])
@@ -374,7 +376,7 @@ class ShareManager(object):
                    if smb_on else "\\\\%s" % ip,
             "error": self.last_error.get("smb", ""),
             "account": self.smb.account_state()[0],
-            "mode": self._smb_mode(),
+            "hardened": self.smb.check_hardening(self._smb_cred()[0])[0],
             "user": self._smb_cred()[0],
             "password": self._smb_cred()[1],
             "issues": [],

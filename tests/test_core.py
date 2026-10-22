@@ -12,6 +12,7 @@ HTTP 服务端测 Range/206/416/目录列表/上传，FTP 测登录/列目录/�
 import ftplib
 import io
 import os
+import shutil
 import socket
 import sys
 import tempfile
@@ -1091,9 +1092,11 @@ class TestSmbDiagnose(unittest.TestCase):
         # 修复本身只在该进程有管理员时执行；这一条单测验的是「命令序列」，
         # 所以把权限门放开，别让 is_admin() 的环境差异干扰断言
         m.available = lambda: (True, "OK")
+        # LSA 加固要管理员权限，这里只验命令序列，替换成「成功」
+        m.harden_account = lambda user=None: (True, "已限制为只能网络登录")
         try:
             done, failed = m.repair([{"name": "s", "path": d}],
-                                    mode="account", user="FileShare",
+                                    user="FileShare",
                                     password="MyPass@2026")
             self.assertEqual([], failed, failed)
             flat = [" ".join(c) for c in self.calls if c and c[0] != "PS"]
@@ -1110,49 +1113,6 @@ class TestSmbDiagnose(unittest.TestCase):
                             "应当只授给专用账户：%s" % grants)
             self.assertTrue(all("Everyone" not in c for c in grants),
                             "账号模式不该给 Everyone 授权：%s" % grants)
-        finally:
-            import shutil
-            shutil.rmtree(d, ignore_errors=True)
-
-    def test_repair_everyone_mode(self):
-        """免密模式：开 Guest、不建账户、目录授权 Everyone。"""
-        import tempfile
-        d = tempfile.mkdtemp(prefix="fs_smb_ev_")
-
-        def run(args, timeout=20):
-            self.calls.append(list(args))
-            if args[:2] == ["net", "user"] and len(args) == 3:
-                name = args[2]
-                if name == "Guest":
-                    return 0, "帐户启用    Yes"
-                return 2, "找不到用户名。"
-            return 0, ""
-
-        m = self._mgr(run_reply=run)
-
-        def ps(script, timeout=30):
-            # 防火墙检测要返回「已放行」，Guest 策略查询返回 0（允许空密码）
-            if "Get-NetFirewallRule" in script:
-                return 0, "OPEN:测试规则"
-            return 0, "0"
-
-        m._ps = ps
-        m.available = lambda: (True, "OK")
-        try:
-            done, failed = m.repair([{"name": "s", "path": d}], mode="everyone")
-            self.assertEqual([], failed, failed)
-            flat = [" ".join(c) for c in self.calls if c and c[0] != "PS"]
-            # 开了 Guest
-            self.assertTrue(any("net user Guest /active:yes" in c for c in flat),
-                            "没有启用 Guest：%s" % flat)
-            # 不该建专用账户
-            self.assertFalse(any("/add" in c for c in flat),
-                             "免密模式不该创建账户：%s" % flat)
-            # 授权 Everyone
-            grants = [c for c in flat if "/grant" in c]
-            self.assertTrue(grants and all("S-1-1-0" in c or "Everyone" in c
-                                           for c in grants),
-                            "免密模式应当授权 Everyone：%s" % grants)
         finally:
             import shutil
             shutil.rmtree(d, ignore_errors=True)
@@ -1232,7 +1192,7 @@ class TestSmbShareNoop(unittest.TestCase):
         return m
 
     @staticmethod
-    def _query(path, perm="Everyone, READ"):
+    def _query(path, perm="FileShare, READ"):
         return ("共享名       s\n"
                 "路径         %s\n"
                 "备注         文件共享中心\n"
@@ -1244,7 +1204,7 @@ class TestSmbShareNoop(unittest.TestCase):
         import tempfile
         d = tempfile.mkdtemp(prefix="fs_noop_")
         try:
-            m = self._mgr(self._query(d, "Everyone, READ"))
+            m = self._mgr(self._query(d, "FileShare, READ"))
             changed = m.add("s", d, readonly=True)
             self.assertFalse(changed, "已经在目标状态，不该重建")
             self.assertFalse([c for c in self.calls
@@ -1259,13 +1219,29 @@ class TestSmbShareNoop(unittest.TestCase):
         import tempfile
         d = tempfile.mkdtemp(prefix="fs_perm_")
         try:
-            m = self._mgr(self._query(d, "Everyone, FULL"))
+            m = self._mgr(self._query(d, "FileShare, FULL"))
             changed = m.add("s", d, readonly=True)
             self.assertTrue(changed, "权限变了必须重建")
             self.assertTrue([c for c in self.calls
                              if "/delete" in " ".join(c)])
-            created = [c for c in self.calls if "/grant:Everyone,READ" in " ".join(c)]
-            self.assertTrue(created, "重建时没有下发只读权限")
+            created = [c for c in self.calls
+                       if "/grant:FileShare,READ" in " ".join(c)]
+            self.assertTrue(created, "重建时没有把只读权限授给指定账户")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_add_recreates_when_grant_is_still_everyone(self):
+        """老共享授的是 Everyone：即使权限级别对得上，也要重建收紧。"""
+        import shutil
+        import tempfile
+        d = tempfile.mkdtemp(prefix="fs_ev_")
+        try:
+            m = self._mgr(self._query(d, "Everyone, READ"))
+            changed = m.add("s", d, readonly=True, account="FileShare")
+            self.assertTrue(changed, "Everyone 授权必须被替换成指定账户")
+            flat = [" ".join(c) for c in self.calls]
+            self.assertTrue(any("/grant:FileShare,READ" in c for c in flat), flat)
+            self.assertFalse(any("/grant:Everyone" in c for c in flat), flat)
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
@@ -1399,43 +1375,155 @@ class TestSmbLogonCheck(unittest.TestCase):
 
     def test_diagnose_flags_bad_password(self):
         m = self._mgr(2, "发生系统错误 1326。\n\n用户名或密码不正确。")
-        issues = m.diagnose([], mode="account", user="FileShare", password="x")
+        issues = m.diagnose([], user="FileShare", password="x")
         keys = {i["key"]: i for i in issues}
         self.assertIn("logon", keys)
         self.assertTrue(keys["logon"]["fixable"], "密码错可以通过重置账户修好")
         self.assertIn("密码", keys["logon"]["title"])
 
-    def test_diagnose_guest_blocked_not_fixable(self):
-        m = self._mgr(2, "发生系统错误 1385。")
-        issues = m.diagnose([], mode="everyone")
-        keys = {i["key"]: i for i in issues}
-        self.assertIn("guest", keys)
-        self.assertFalse(keys["guest"]["fixable"],
-                         "这是安全策略，程序不该假装能修")
-        self.assertIn("1385", keys["guest"]["detail"])
-
-    def test_default_mode_is_account(self):
-        """默认必须是账号模式：免密在多数 Win10/11 上根本走不通。"""
-        from fileshare.config import Config
-        import tempfile
+    def test_config_has_no_mode_key(self):
+        """免密模式已移除：默认配置里不该再有 smb.mode。"""
         import os
+        import shutil
+        import tempfile
+
+        from fileshare.config import Config
+
         d = tempfile.mkdtemp(prefix="fs_cfg_")
         try:
             cfg = Config(path=os.path.join(d, "config.json"))
-            self.assertEqual("account", cfg.get("smb", "mode"))
+            self.assertNotIn("mode", cfg.data["smb"])
+            self.assertEqual("FileShare", cfg.get("smb", "user"))
         finally:
-            import shutil
             shutil.rmtree(d, ignore_errors=True)
 
 
-class TestSmbModeFallback(unittest.TestCase):
-    """免密模式被安全策略堵死时要自动换成账号模式。
+class TestSmbMigration(unittest.TestCase):
+    """老配置（免密模式）升级：丢掉 mode 键，并收回 Everyone 目录授权。"""
 
-    否则用户开着 SMB、界面也没红字，但别的机器永远卡在「输入网络凭据」——
-    这正是 v1.1.2 之前的状态。
+    def test_stale_mode_key_is_dropped(self):
+        import json
+        import os
+        import shutil
+        import tempfile
+
+        from fileshare.config import Config
+
+        d = tempfile.mkdtemp(prefix="fs_mig_")
+        try:
+            path = os.path.join(d, "config.json")
+            with open(path, "w", encoding="utf-8") as fp:
+                json.dump({"schema": 9,
+                           "smb": {"enabled": True, "mode": "everyone",
+                                   "user": "FileShare"}}, fp)
+            cfg = Config(path=path)
+            self.assertNotIn("mode", cfg.data["smb"],
+                             "旧配置里的 mode 必须清掉")
+            # 落盘后也不能留着
+            with open(path, encoding="utf-8") as fp:
+                saved = json.load(fp)
+            self.assertNotIn("mode", saved.get("smb", {}))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_drop_legacy_everyone_revokes_recorded_acl(self):
+        """记录里给过 Everyone 的目录，要按记录撤掉，且不动账户授权。"""
+        from fileshare.server.smb import SmbManager
+
+        m = SmbManager()
+        m.granted = [["E:\\a", "Everyone"], ["E:\\b", "FileShare"]]
+        revoked = []
+
+        def fake_revoke(path, principal):
+            revoked.append((path, principal))
+            return True, ""
+
+        m.revoke_ntfs = fake_revoke
+        m._save_granted = lambda: None
+        # 绕过管理员检查（单测环境没有管理员）
+        import fileshare.server.smb as smb_mod
+        orig = smb_mod.is_admin
+        smb_mod.is_admin = lambda: True
+        try:
+            done, failed = m.drop_legacy_everyone([])
+        finally:
+            smb_mod.is_admin = orig
+        self.assertEqual([], failed)
+        self.assertEqual(["E:\\a"], [p for p, _who in revoked],
+                         "只该撤 Everyone，不能碰指定账户的授权")
+        self.assertEqual([["E:\\b", "FileShare"]], m.granted,
+                         "账户授权要保留在记录里，取消共享时还要用")
+        self.assertEqual(1, len(done))
+
+
+class TestFtpAnonymous(unittest.TestCase):
+    """FTP 匿名访问：任意用户名/密码能进，且**固定只读**。
+
+    这是「免验证只读」在 Windows 上真正可行的方案 —— FTP 不涉及系统账户，
+    不会撞上 Guest 被「拒绝从网络访问」那套策略。
     """
 
-    def test_auto_switch_when_guest_blocked(self):
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="fs_anon_")
+        cls.share = os.path.join(cls.tmp, "media")
+        os.makedirs(cls.share)
+        cls.file = os.path.join(cls.share, "a.txt")
+        with open(cls.file, "w", encoding="utf-8") as fp:
+            fp.write("hello\n")
+        cls.port = free_port()
+        cls.srv = FtpServer(
+            lambda: [{"name": "media", "path": cls.share}],
+            port=cls.port, user="share", password="p@ss",
+            anonymous=True, allow_upload=True)     # 故意把上传开着
+        ok, msg = cls.srv.start()
+        assert ok, msg
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.stop()
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def _connect(self):
+        ftp = ftplib.FTP()
+        ftp.encoding = "utf-8"
+        ftp.connect("127.0.0.1", self.port, timeout=15)
+        return ftp
+
+    def test_any_credentials_accepted(self):
+        ftp = self._connect()
+        try:
+            ftp.login("anonymous", "whatever@example.com")
+            self.assertIn("media", ftp.nlst())
+        finally:
+            ftp.quit()
+
+    def test_arbitrary_user_still_works(self):
+        """电视盒子/播放器常把用户名填成 admin、密码填 123，也要能进。"""
+        ftp = self._connect()
+        try:
+            ftp.login("admin", "123")
+            self.assertIn("media", ftp.nlst())
+        finally:
+            ftp.quit()
+
+    def test_anonymous_cannot_write(self):
+        """匿名会话固定只读：即使配置里开着 upload，也不能落盘。"""
+        ftp = self._connect()
+        try:
+            ftp.login("anonymous", "x")
+            with self.assertRaises(ftplib.error_perm):
+                ftp.storbinary("STOR hacked.txt",
+                               io.BytesIO(b"boom"))
+        finally:
+            ftp.quit()
+        self.assertFalse(os.path.exists(os.path.join(self.share, "hacked.txt")))
+
+
+class TestFtpAnonymousWiring(unittest.TestCase):
+    """manager 接线：开了匿名访问就强制只读，避免「谁都能写」。"""
+
+    def test_anonymous_forces_readonly(self):
         import os
         import shutil
         import tempfile
@@ -1443,48 +1531,120 @@ class TestSmbModeFallback(unittest.TestCase):
         from fileshare.config import Config
         from fileshare.server.manager import ShareManager
 
-        d = tempfile.mkdtemp(prefix="fs_mode_")
+        d = tempfile.mkdtemp(prefix="fs_anonw_")
         try:
             cfg = Config(path=os.path.join(d, "config.json"))
-            cfg.data["smb"]["mode"] = "everyone"
-            cfg.data["smb"]["enabled"] = True
-            cfg.data["shares"] = []
+            cfg.data["ftp"].update({"enabled": True, "anonymous": True,
+                                    "upload": True, "port": free_port()})
+            cfg.data["shares"] = [{"name": "m", "path": d, "enabled": True}]
             mg = ShareManager(cfg)
-            mg.smb.available = lambda: (True, "OK")
-            mg.smb.guest_state = lambda: (
-                False, "来宾账户被「拒绝从网络访问这台计算机」拦住"
-                       "（错误 1385），免密访问在这台机器上走不通，请改用账号模式")
-            mg.smb.sync = lambda shares, readonly=True: ([], [])
-            mg.smb.repair = lambda *a, **k: ([], [])
-            mg.smb.diagnose = lambda *a, **k: []
-
-            mg.sync_smb()
-            self.assertEqual("account", cfg.get("smb", "mode"),
-                             "1385 时应当自动切到账号模式")
+            try:
+                ok, _msg = mg.start_ftp()
+                if ok:
+                    self.assertFalse(mg.ftp.allow_upload,
+                                     "匿名模式必须强制只读")
+                    self.assertTrue(mg.ftp.anonymous)
+                else:
+                    # 端口被系统抢走的极少数情况，跳过而不是假失败
+                    self.skipTest("FTP 端口不可用：%s" % _msg)
+            finally:
+                mg.stop_ftp()
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
-    def test_keep_everyone_when_guest_works(self):
-        import os
-        import shutil
-        import tempfile
 
-        from fileshare.config import Config
-        from fileshare.server.manager import ShareManager
+class TestSmbHardening(unittest.TestCase):
+    """共享账户加固：只能网络登录，别的一概不许。
 
-        d = tempfile.mkdtemp(prefix="fs_mode2_")
+    这是「同一个账号不会被拿去做别的事」的技术保证 —— 光靠共享权限
+    是不够的：账户本身还能坐在这台机器前登录、能 RDP、能跑服务。
+    """
+
+    def _mgr(self):
+        from fileshare.server import smb as smb_mod
+        m = smb_mod.SmbManager()
+        self.calls = []
+        m._run = lambda args, timeout=20: (self.calls.append(list(args)),
+                                           (0, ""))[1]
+        m._ps = lambda script, timeout=30: (self.calls.append(["PS", script]),
+                                            (0, ""))[1]
+        return m
+
+    def test_harden_account_commands(self):
+        from fileshare.server import smb as smb_mod
+
+        m = self._mgr()
+        added = {}
+        orig = (smb_mod._account_sid, smb_mod._lsa_add_rights,
+                smb_mod._lsa_account_rights)
+        smb_mod._account_sid = lambda name: b"sid"
+        smb_mod._lsa_add_rights = lambda sid, rights: (
+            added.update({"rights": list(rights)}), (True, ""))[1]
+        smb_mod._lsa_account_rights = lambda sid: list(smb_mod.DENY_RIGHTS)
         try:
-            cfg = Config(path=os.path.join(d, "config.json"))
-            cfg.data["smb"]["mode"] = "everyone"
-            cfg.data["shares"] = []
-            mg = ShareManager(cfg)
-            mg.smb.available = lambda: (True, "OK")
-            mg.smb.guest_state = lambda: (True, "免密访问条件已就绪")
-            mg.smb.sync = lambda shares, readonly=True: ([], [])
-            mg.smb.repair = lambda *a, **k: ([], [])
-
-            mg.sync_smb()
-            self.assertEqual("everyone", cfg.get("smb", "mode"),
-                             "来宾能用时不要擅自动用户的设置")
+            ok, why = m.harden_account("FileShare")
         finally:
-            shutil.rmtree(d, ignore_errors=True)
+            (smb_mod._account_sid, smb_mod._lsa_add_rights,
+             smb_mod._lsa_account_rights) = orig
+        self.assertTrue(ok, why)
+        flat = [" ".join(c) for c in self.calls]
+        self.assertTrue(any("/passwordchg:no" in c for c in flat),
+                        "用户不该能改共享账户密码：%s" % flat)
+        self.assertTrue(any("PasswordNeverExpires" in c for c in flat),
+                        "密码必须永不过期")
+        self.assertTrue(any("S-1-5-32-544" in c for c in flat),
+                        "要从管理员组里踢掉")
+        self.assertTrue(any("S-1-5-32-555" in c for c in flat),
+                        "要从远程桌面用户组里踢掉")
+        self.assertEqual(list(smb_mod.DENY_RIGHTS), added.get("rights"),
+                         "没有写入三条拒绝登录权利")
+
+    def test_check_hardening_reports_missing(self):
+        from fileshare.server import smb as smb_mod
+
+        m = self._mgr()
+        orig = (smb_mod._account_sid, smb_mod._lsa_account_rights)
+        smb_mod._account_sid = lambda name: b"sid"
+        smb_mod._lsa_account_rights = lambda sid: [smb_mod.DENY_RIGHTS[0]]
+        try:
+            ok, why, missing = m.check_hardening("FileShare")
+        finally:
+            (smb_mod._account_sid, smb_mod._lsa_account_rights) = orig
+        self.assertFalse(ok)
+        self.assertEqual(2, len(missing))
+        self.assertIn("缺", why)
+
+    def test_harden_reports_failure_instead_of_lying(self):
+        from fileshare.server import smb as smb_mod
+
+        m = self._mgr()
+        orig = (smb_mod._account_sid, smb_mod._lsa_add_rights)
+        smb_mod._account_sid = lambda name: b"sid"
+        smb_mod._lsa_add_rights = lambda sid, rights: (
+            False, "LsaOpenPolicy 失败（0xC0000022）")
+        try:
+            ok, why = m.harden_account("FileShare")
+        finally:
+            (smb_mod._account_sid, smb_mod._lsa_add_rights) = orig
+        self.assertFalse(ok)
+        self.assertIn("0xC0000022", why)
+
+    def test_diagnose_warns_when_not_hardened(self):
+        """没有管理员读不到权利 → 不该乱报；能读到但缺失 → 给可修警告。"""
+        from fileshare.server import smb as smb_mod
+
+        m = self._mgr()
+        m.diagnose_base_stub = True
+        orig = (smb_mod._account_sid, smb_mod._lsa_account_rights)
+        smb_mod._account_sid = lambda name: b"sid"
+        smb_mod._lsa_account_rights = lambda sid: []
+        try:
+            m.firewall_state = lambda: (True, "已放行")
+            m._run = lambda args, timeout=20: (
+                0, "  TCP 0.0.0.0:445 0.0.0.0:0 LISTENING 4"
+                if "netstat" in " ".join(args) else "帐户启用 Yes")
+            issues = m.diagnose([], user="FileShare", password="fileshare")
+        finally:
+            (smb_mod._account_sid, smb_mod._lsa_account_rights) = orig
+        keys = {i["key"] for i in issues}
+        self.assertIn("harden", keys)

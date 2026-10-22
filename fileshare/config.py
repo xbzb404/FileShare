@@ -64,9 +64,9 @@ DEFAULTS = {
     "smb": {
         "enabled": False,
         "readonly": True,
-        # everyone = 免密只读（Everyone 权限，任何设备直接进）
-        # account  = 用专用本地账户，需输入用户名密码
-        "mode": "account",
+        # 只支持「指定账户」：免密/匿名在 Win10/11 上拿不到网络登录权限
+        # （Guest 在「拒绝从网络访问这台计算机」里，错误 1385），
+        # 给 Everyone 授权既换不来免密，又等于把目录对整机放开。
         "user": "FileShare",
         "password": "",
         "granted": [],       # 本程序加过的目录授权，取消共享时按它还原
@@ -136,6 +136,12 @@ class Config(object):
                 self._dirty = True
             if not self.data["download"].get("dir"):
                 self.data["download"]["dir"] = default_download_dir()
+            # 免密（everyone）模式已移除：旧配置里的 smb.mode 直接丢掉，
+            # 免得留着让人以为还能切回去。目录上当时加的 Everyone 授权
+            # 由 SmbManager.drop_legacy_everyone() 在开共享时收回。
+            if "mode" in self.data.get("smb", {}):
+                self.data["smb"].pop("mode", None)
+                self._dirty = True
             self.data["shares"] = [s for s in self.data.get("shares", [])
                                    if isinstance(s, dict) and s.get("path")]
         return self.data

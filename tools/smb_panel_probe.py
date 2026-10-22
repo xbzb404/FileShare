@@ -1,5 +1,8 @@
 # -*- coding: utf-8 -*-
-"""临时探针：验证 SMB 面板在两种模式下渲染正常（含凭据行、复制按钮）。"""
+"""SMB 面板探针：只保留「指定账户」后，面板该显示什么、不该显示什么。
+
+跑法：``python tools/smb_panel_probe.py``
+"""
 import os
 import sys
 import tempfile
@@ -15,18 +18,18 @@ FAILS = []
 
 
 def check(name, ok, extra=""):
-    print(("  [OK]   " if ok else "  [FAIL] ") + name + (("  " + extra) if extra else ""))
+    print(("  [OK]   " if ok else "  [FAIL] ") + name
+          + (("  " + extra) if extra else ""))
     if not ok:
         FAILS.append(name)
 
 
-def build(mode):
+def build(hardened=True):
     tmp = tempfile.mkdtemp(prefix="fs_panel_")
     cfg = Config(path=os.path.join(tmp, "config.json"))
     cfg.data["http"]["enabled"] = False
     cfg.data["ftp"]["enabled"] = False
     cfg.data["smb"]["enabled"] = False
-    cfg.data["smb"]["mode"] = mode
     cfg.data["smb"]["password"] = "fileshare"
     cfg.data["shares"] = [{"name": "Fshare", "path": tmp, "enabled": True}]
     cfg.data["download"]["dir"] = tmp
@@ -45,6 +48,7 @@ def build(mode):
         st["smb"]["url"] = "\\\\192.168.49.253\\Fshare"
         st["smb"]["user"] = "FileShare"
         st["smb"]["password"] = "fileshare"
+        st["smb"]["hardened"] = hardened
         return st
 
     app.manager.status = patched
@@ -64,25 +68,22 @@ def texts(app):
     return [c.itemcget(i, "text") for i in c.find_all() if c.type(i) == "text"]
 
 
-def run(mode):
-    print("== 模式 %s ==" % mode)
-    app, root = build(mode)
+def run():
+    print("== 指定账户模式 ==")
+    app, root = build(hardened=True)
     try:
         c = app.scroll.canvas
         ts = texts(app)
-        joined = " | ".join(ts)
-        if mode == "account":
-            check("凭据行可见", any("用户名  FileShare" in t for t in ts),
-                  "找到：%s" % [t for t in ts if "用户名" in t][:1])
-            check("提示弹凭据框", any("输入网络凭据" in t for t in ts))
-            check("提示带共享名", any("只输" in t and "枚举" in t for t in ts))
-            check("有复制按钮", any("复制凭据" in t for t in ts))
-        else:
-            check("免密被拦时给换模式按钮",
-                  any("改用账号模式" in t for t in ts))
-            check("免密文案已改（不推荐）",
-                  any("不推荐" in t for t in ts))
-        # 几何：所有文字不越出画布宽度
+        check("凭据行可见", any("用户名  FileShare" in t for t in ts),
+              "找到：%s" % [t for t in ts if "用户名" in t][:1])
+        check("提示弹凭据框", any("输入网络凭据" in t for t in ts))
+        check("提示带共享名", any("只输" in t and "枚举" in t for t in ts))
+        check("有复制按钮", any("复制凭据" in t for t in ts))
+        check("已加固时有说明", any("只能从网络登录" in t for t in ts))
+        check("不再有免密开关", not any("免密只读" in t for t in ts))
+        check("不再有换模式按钮", not any("改用账号模式" in t for t in ts))
+        check("写明只能用这个账户", any("只能用这个账户访问" in t for t in ts))
+
         w = c.winfo_width()
         over = []
         for i in c.find_all():
@@ -97,9 +98,19 @@ def run(mode):
     finally:
         app._quit()
 
+    print("\n== 未加固时 ==")
+    app2, _root2 = build(hardened=False)
+    try:
+        ts2 = texts(app2)
+        check("未加固时给提示", any("还能用于本地或远程桌面登录" in t
+                                   for t in ts2))
+    finally:
+        app2._quit()
+
+    print("\n%s" % ("PANEL PROBE PASS" if not FAILS
+                    else "PANEL PROBE FAIL: %s" % FAILS))
+    return 0 if not FAILS else 1
+
 
 if __name__ == "__main__":
-    run("account")
-    run("everyone")
-    print("\n%s" % ("PANEL PROBE PASS" if not FAILS else "PANEL PROBE FAIL: %s" % FAILS))
-    sys.exit(0 if not FAILS else 1)
+    sys.exit(run())
