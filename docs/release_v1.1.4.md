@@ -26,8 +26,8 @@ SMB 去掉「免密（Everyone）」模式，只保留指定账户；账户自�
 - 面板会显示加固状态：已加固 → 绿字说明；未加固 → 提示点「修复局域网访问」
 
 > 仍需注意：任何账户登录后天然属于 `Authenticated Users`，所以本机其它对
-> `Authenticated Users` 开放的共享它也能读。要彻底隔离，给敏感目录加
-> `icacls D:\私密 /deny FileShare:(OI)(CI)(RX)`（Deny 优先于 Allow）。
+> `Authenticated Users` 开放的共享它也能读。要彻底隔离，给敏感目录加一条拒绝项：
+> `icacls "<敏感目录>" /deny FileShare:(OI)(CI)(RX)`（Deny 优先于 Allow）。
 
 ## FTP 的匿名只读（新的界面开关）
 

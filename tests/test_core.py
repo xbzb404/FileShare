@@ -1648,3 +1648,64 @@ class TestSmbHardening(unittest.TestCase):
             (smb_mod._account_sid, smb_mod._lsa_account_rights) = orig
         keys = {i["key"] for i in issues}
         self.assertIn("harden", keys)
+
+
+class TestReleaseNotesLint(unittest.TestCase):
+    """Release 说明检查：公开文档里不能出现聊天口吻和私有信息。
+
+    起因：v1.1.3 的说明里写了「你截图里的那个框」和用户机器的
+    192.168.49.253 —— 那是把聊天回复直接粘进了公开发布页。
+    """
+
+    def _lint_text(self, text):
+        import tempfile
+        from tools.lint_notes import lint
+
+        fd, path = tempfile.mkstemp(suffix=".md")
+        os.close(fd)
+        try:
+            with open(path, "w", encoding="utf-8") as fp:
+                fp.write(text)
+            return lint(path)
+        finally:
+            os.remove(path)
+
+    def test_flags_second_person_and_private_ip(self):
+        hits = self._lint_text(
+            "## 你截图里的那个框\n\n"
+            "对方机器弹出「输入你的凭据以连接到 192.168.49.253」。\n")
+        names = {h[0] for h in hits}
+        self.assertIn("第二人称", names)
+        self.assertIn("私有 IP", names)
+        self.assertIn("聊天残留", names)
+
+    def test_allows_quoted_system_prompt(self):
+        """代码块里的系统原始提示语（含「你」）不算聊天口吻。"""
+        hits = self._lint_text(
+            "## 报错说明\n\n"
+            "```\n你想继续此操作吗? (Y/N) [N]:\n```\n")
+        names = {h[0] for h in hits}
+        self.assertNotIn("第二人称", names)
+
+    def test_allows_generic_screenshot_advice(self):
+        hits = self._lint_text("遇到问题请提 Issue，附上运行日志页的截图会更快定位。")
+        self.assertEqual([], hits)
+
+    def test_flags_local_path_and_machine_name(self):
+        hits = self._lint_text("路径 E:\\AI工程\\fileshare，机器 DESKTOP-ICD6ETA。\n")
+        names = {h[0] for h in hits}
+        self.assertIn("本机路径", names)
+        self.assertIn("机器名", names)
+
+    def test_real_release_notes_are_clean(self):
+        """仓库里所有 release 说明都必须是干净的。"""
+        from tools.lint_notes import lint
+
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        docs = os.path.join(root, "docs")
+        files = [f for f in sorted(os.listdir(docs))
+                 if f.startswith("release_") and f.endswith(".md")]
+        self.assertTrue(files, "没有找到 release 说明")
+        for name in files:
+            hits = lint(os.path.join(docs, name))
+            self.assertEqual([], hits, "%s 有问题：%s" % (name, hits[:3]))

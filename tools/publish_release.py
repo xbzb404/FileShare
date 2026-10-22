@@ -188,12 +188,32 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--update-body", action="store_true",
                     help="release 已存在时，用 --notes 覆盖它的说明")
+    ap.add_argument("--skip-lint", action="store_true",
+                    help="跳过说明文件检查（不推荐：Release 是公开文档）")
     args = ap.parse_args()
 
     notes = ""
     if args.notes:
         with open(args.notes, "r", encoding="utf-8") as fp:
             notes = fp.read()
+        # Release 说明是给所有读者看的文档，不是聊天回复：
+        # 第二人称、私有 IP、本机路径这类东西不能进公开页面。
+        if not args.skip_lint:
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            try:
+                from lint_notes import lint
+            except ImportError:
+                lint = None
+            hits = lint(args.notes) if lint else []
+            if hits:
+                print("说明文件有问题，已停止发布：%s" % args.notes,
+                      file=sys.stderr)
+                for name, line, snippet, hint in hits[:8]:
+                    print("  %-8s %s  …%s…" % (name, line or "", snippet[:50]),
+                          file=sys.stderr)
+                    print("            %s" % hint, file=sys.stderr)
+                print("改完再发；确实要强行发就加 --skip-lint", file=sys.stderr)
+                return 3
 
     token = get_token()
     if not token and not args.dry_run:
