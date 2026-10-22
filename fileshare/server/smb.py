@@ -85,8 +85,10 @@ class SmbManager(object):
 
     # ------------------------------------------------------------ 查询
     def exists(self, name):
-        rc, _out = self._run(["net", "share", name])
-        return rc == 0
+        # 非管理员查共享会以「系统错误 5」结尾（返回码非 0），但共享名和路径
+        # 其实已经打印出来了；所以不能只看返回码，否则会误判成「不存在」
+        # 进而去重建，又把正在用共享的客户端踢掉。
+        return self.info(name) is not None
 
     def list_all(self):
         """本机所有共享名 → 路径。解析 ``net share`` 的输出。"""
@@ -112,13 +114,48 @@ class SmbManager(object):
         return result
 
     # ------------------------------------------------------------ 增删
+    def info(self, name):
+        """``net share <name>`` 的关键字段 → ``{path, perm, remark}``。
+
+        非管理员查自己的共享也只能拿到前几行（后面报系统错误 5），
+        所以只要解析出路径就算有效，权限行缺了就当「未知」。
+        """
+        rc, out = self._run(["net", "share", name])
+        data = {}
+        for line in (out or "").splitlines():
+            parts = line.split(None, 1)
+            if len(parts) != 2:
+                continue
+            key, val = parts[0], parts[1].strip()
+            if key in ("路径", "Path"):
+                data["path"] = val
+            elif key in ("权限", "Permissions"):
+                data["perm"] = val
+            elif key in ("备注", "注解", "Remark"):
+                data["remark"] = val
+        return data or None
+
     def add(self, name, path, readonly=True, remark="文件共享中心"):
         if not os.path.isdir(path):
             raise SmbError("目录不存在：%s" % path)
         perm = "READ" if readonly else "FULL"
-        # 先删同名的（可能是上次没退干净，或用户改了路径/权限）
-        if self.exists(name):
-            self.remove(name)
+
+        # 已经是我们要的样子就什么都不做。
+        # 以前是无条件「删了重建」：只要哪个客户端还开着共享里的文件，
+        # ``net share /delete`` 就会问「继续会强制关闭文件，是否继续」，
+        # 无头进程读不到回答 → 报「没有提供有效的响应」，共享反而建不起来，
+        # 正在传输的连接也会被踢断。重复 sync（开服务、点修复、切页）
+        # 本来就不该动一个健康的共享。
+        cur = self.info(name)
+        if cur and _same_path(cur.get("path"), path):
+            perm_now = (cur.get("perm") or "").upper()
+            if not perm_now or perm in perm_now:
+                self.managed.add(name)
+                return False                     # False = 没改动
+
+        # 路径或权限真的变了才重建（``cur`` 就是刚查到的那份，别重复查）
+        if cur:
+            self.remove(name, force=False)
         rc, out = self._run([
             "net", "share", "%s=%s" % (name, path),
             "/grant:Everyone,%s" % perm,
@@ -128,9 +165,19 @@ class SmbManager(object):
         if rc != 0:
             raise SmbError(_clean(out) or "创建共享失败（返回码 %d）" % rc)
         self.managed.add(name)
+        return True
 
-    def remove(self, name):
-        rc, out = self._run(["net", "share", name, "/delete"])
+    def remove(self, name, force=True):
+        """删共享。``force=True`` 时加 ``/y``：不弹「是否强制关闭文件」的确认。
+
+        共享里有客户端开着文件时，``net share /delete`` 默认会问一句
+        「继续这项操作会强制关闭文件，你想继续吗 (Y/N) [N]」，无头进程
+        答不上来就失败。加 ``/y`` 直接按「继续」处理。
+        """
+        args = ["net", "share", name, "/delete"]
+        if force:
+            args.append("/y")
+        rc, out = self._run(args)
         if rc != 0:
             rc2, out2 = run_hidden(
                 ["cmd", "/c", "echo Y| net share %s /delete" % name], timeout=20)
@@ -669,8 +716,9 @@ if ($hit.Count -gt 0) { 'OPEN:' + (($hit | Sort-Object -Unique) -join ';') } els
                     errors.append("%s：%s" % (name, exc))
         for name, path in want.items():
             try:
-                self.add(name, path, readonly=readonly)
-                done.append(("add", name))
+                changed = self.add(name, path, readonly=readonly)
+                if changed:
+                    done.append(("add", name))
             except SmbError as exc:
                 errors.append("%s：%s" % (name, exc))
         if self.log is not None:
@@ -681,13 +729,16 @@ if ($hit.Count -gt 0) { 'OPEN:' + (($hit | Sort-Object -Unique) -join ';') } els
                 self.log.add("err", "SMB 失败：%s" % err, "SMB")
         return done, errors
 
-    def remove_all(self, restore=True, principals=None):
+    def remove_all(self, restore=True, principals=None, paths=None):
         """取消共享：删掉本程序建的共享，并把加过的目录权限还原。
 
         ``restore=True`` 时会把 ``grant_ntfs`` 记录过的 ACE 逐条撤掉——
         共享都取消了还留着 Everyone/共享账户的读写权限，等于给整机开了
         一个长期后门。账户和防火墙规则保留（前者没有目录权限就进不来，
         后者下次开共享还要用，反复改防火墙反而容易出错）。
+
+        ``principals`` / ``paths`` 由调用方按当前模式与共享列表给出，
+        让「记录丢了但上次确实授权过」的场景也能还原。
         """
         for name in list(self.managed):
             try:
@@ -695,11 +746,36 @@ if ($hit.Count -gt 0) { 'OPEN:' + (($hit | Sort-Object -Unique) -join ';') } els
             except SmbError:
                 pass
         if restore:
-            return self.revoke_all(principals)
+            return self.revoke_all(principals, paths)
         return [], []
 
 
+def _norm_path(path):
+    """路径归一化：分隔符、大小写、结尾斜杠都不该影响比较。"""
+    return os.path.normpath(path or "").replace("\\", "/").rstrip("/").lower()
+
+
+def _same_path(a, b):
+    return bool(a) and bool(b) and _norm_path(a) == _norm_path(b)
+
+
+# 交互确认留下的残渣：这些句子不该出现在界面上
+_PROMPT_NOISE = (
+    "(Y/N)", "Y/N", "没有提供有效的响应", "No valid response",
+    "你想继续此操作吗", "Do you want to continue this operation",
+)
+
+
 def _clean(text):
-    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
-    lines = [ln for ln in lines if not ln.startswith("命令成功完成")]
+    raw = text or ""
+    low = raw.lower()
+    if "强制关闭" in raw or "force the files closed" in low:
+        # 共享正被客户端使用：这是「稍后再试」，不是配置错误
+        return "共享正在被其它设备使用（有文件没关闭），本次操作已跳过"
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    lines = [ln for ln in lines
+             if not ln.startswith("命令成功完成")
+             and not ln.startswith("The command completed successfully")
+             and not any(h in ln for h in _PROMPT_NOISE)]
     return " ".join(lines)[:300]
+

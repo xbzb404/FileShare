@@ -1196,3 +1196,144 @@ class TestSmbDiagnose(unittest.TestCase):
         finally:
             import shutil
             shutil.rmtree(d, ignore_errors=True)
+
+
+class TestSmbShareNoop(unittest.TestCase):
+    """共享增删的健壮性：不做无谓重建、不带交互确认、错误文本要干净。
+
+    背景（用户截图里那句黄字）：
+    「Fshare: 用户打开了 Fshare 上的文件，继续这项操作会强制关闭文件。
+      你想继续此操作吗? (Y/N) [N]: 没有提供有效的响应。」
+
+    两处根因：
+    1. 打包版没有控制台，``run_hidden`` 又继承了父进程的 stdin（无效句柄），
+       ``net share /delete`` 一遇到确认就读不到答案，直接失败；
+    2. ``add()`` 每次 sync 都「删了重建」，只要客户端还开着里面的文件，
+       就会触发那个确认——不但报错，还把人家正在传的连接踢断。
+    """
+
+    def _mgr(self, query_out):
+        from fileshare.server.smb import SmbManager
+        m = SmbManager()
+        self.calls = []
+
+        def fake(args, timeout=20):
+            self.calls.append(list(args))
+            joined = " ".join(args)
+            if args[:2] == ["net", "share"] and len(args) == 3:
+                return 0, query_out
+            if "/delete" in joined:
+                return 0, "命令成功完成。"
+            return 0, "命令成功完成。"
+
+        m._run = fake
+        return m
+
+    @staticmethod
+    def _query(path, perm="Everyone, READ"):
+        return ("共享名       s\n"
+                "路径         %s\n"
+                "备注         文件共享中心\n"
+                "权限         %s\n"
+                "命令成功完成。\n" % (path, perm))
+
+    def test_add_skips_recreate_when_already_right(self):
+        import shutil
+        import tempfile
+        d = tempfile.mkdtemp(prefix="fs_noop_")
+        try:
+            m = self._mgr(self._query(d, "Everyone, READ"))
+            changed = m.add("s", d, readonly=True)
+            self.assertFalse(changed, "已经在目标状态，不该重建")
+            self.assertFalse([c for c in self.calls
+                              if "/delete" in " ".join(c)],
+                             "重建会踢掉正在用共享的客户端")
+            self.assertIn("s", m.managed, "已存在的本人共享也要纳入管理")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_add_recreates_when_perm_changed(self):
+        import shutil
+        import tempfile
+        d = tempfile.mkdtemp(prefix="fs_perm_")
+        try:
+            m = self._mgr(self._query(d, "Everyone, FULL"))
+            changed = m.add("s", d, readonly=True)
+            self.assertTrue(changed, "权限变了必须重建")
+            self.assertTrue([c for c in self.calls
+                             if "/delete" in " ".join(c)])
+            created = [c for c in self.calls if "/grant:Everyone,READ" in " ".join(c)]
+            self.assertTrue(created, "重建时没有下发只读权限")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_add_treats_other_path_as_change(self):
+        import shutil
+        import tempfile
+        d = tempfile.mkdtemp(prefix="fs_path_")
+        try:
+            m = self._mgr(self._query("E:\\other"))
+            self.assertTrue(m.add("s", d, readonly=True))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_remove_asks_no_questions(self):
+        m = self._mgr("")
+        m.remove("s")
+        dels = [c for c in self.calls if "/delete" in " ".join(c)]
+        self.assertTrue(dels, "没有真的删共享")
+        self.assertIn("/y", dels[0],
+                      "没加 /y：无头进程答不上「是否强制关闭文件」")
+
+    def test_remove_all_forwards_paths(self):
+        """取消共享要把当前目录一起传下去（否则老授权还原不了）。"""
+        from fileshare.server.smb import SmbManager
+        m = SmbManager()
+        m.managed = set()
+        seen = {}
+
+        def fake_revoke(principals=None, paths=None):
+            seen["principals"] = principals
+            seen["paths"] = paths
+            return ["ok"], []
+
+        m.revoke_all = fake_revoke
+        m.remove_all(restore=True, principals=["Everyone"],
+                     paths=["E:\\Fshare"])
+        self.assertEqual(["E:\\Fshare"], seen.get("paths"))
+
+    def test_clean_hides_interactive_prompt(self):
+        from fileshare.server.smb import _clean
+        raw = ("Fshare: 用户打开了 Fshare 上的文件，继续这项操作会强制关闭文件。"
+               "你想继续此操作吗? (Y/N) [N]: 没有提供有效的响应。")
+        msg = _clean(raw)
+        self.assertNotIn("Y/N", msg)
+        self.assertNotIn("没有提供有效的响应", msg)
+        self.assertIn("使用", msg, "应当翻译成「共享正被占用」的人话")
+
+    def test_clean_drops_success_line(self):
+        from fileshare.server.smb import _clean
+        self.assertEqual("", _clean("命令成功完成。"))
+
+    def test_run_hidden_detaches_stdin(self):
+        """子进程绝不能继承父进程的 stdin（windowed 下那是无效句柄）。"""
+        import subprocess
+
+        import fileshare.netutil as nu
+
+        captured = {}
+
+        class FakeP(object):
+            returncode = 0
+            stdout = b""
+            stderr = b""
+
+        orig = nu.subprocess.run
+        nu.subprocess.run = lambda args, **kw: (captured.update(kw), FakeP())[1]
+        try:
+            rc, out = nu.run_hidden(["anything"])
+        finally:
+            nu.subprocess.run = orig
+        self.assertEqual(0, rc)
+        self.assertEqual(subprocess.DEVNULL, captured.get("stdin"),
+                         "stdin 没给 DEVNULL，交互式命令会读不到输入")

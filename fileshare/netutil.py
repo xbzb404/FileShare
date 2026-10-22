@@ -12,8 +12,14 @@ CREATE_NO_WINDOW = 0x08000000 if sys.platform.startswith("win") else 0
 
 
 def run_hidden(args, timeout=15, encoding=None):
-    """跑一个不弹黑窗的子进程，返回 (rc, stdout+stderr)。"""
-    kw = {}
+    """跑一个不弹黑窗的子进程，返回 (rc, stdout+stderr)。
+
+    ``stdin`` 必须给 DEVNULL：默认是「继承父进程」。打包成 ``--windowed``
+    后本进程没有控制台，继承下来的是个无效句柄，被调命令（``net share`` /
+    ``icacls`` 之类）一遇到交互确认就读不到输入，直接吐一句
+    「没有提供有效的响应」然后失败——界面上还会把这句话原样显示出来。
+    """
+    kw = {"stdin": subprocess.DEVNULL}
     if sys.platform.startswith("win"):
         kw["creationflags"] = CREATE_NO_WINDOW
         si = subprocess.STARTUPINFO()

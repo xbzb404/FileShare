@@ -4,7 +4,7 @@
 > **HTTP（浏览器直接下）/ FTP（资源管理器挂载）/ Windows 共享（SMB）三种协议同时开，一个窗口管全**，
 > 还能看到谁在下载、占了多少带宽。
 
-作者：**by zhb** · 版本 1.1.1 · 界面：tkinter + Canvas 自绘（Win11 Fluent 风格）· 单文件 exe 22.7 MB
+作者：**by zhb** · 版本 1.1.2 · 界面：tkinter + Canvas 自绘（Win11 Fluent 风格）· 单文件 exe 22.7 MB
 
 ---
 

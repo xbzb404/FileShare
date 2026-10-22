@@ -234,8 +234,13 @@ class ShareManager(object):
             self.last_error["smb"] = "；".join(errors[:2])
             return False, self.last_error["smb"]
         self.last_error.pop("smb", None)
-        self.log.add("ok", "SMB 共享已同步（%d 个）" % len(done), "SMB")
-        return True, "已同步 %d 个共享" % len(done)
+        if done:
+            self.log.add("ok", "SMB 共享已同步（%d 个）" % len(done), "SMB")
+            return True, "已同步 %d 个共享" % len(done)
+        # 一个都没动 = 本来就是对的状态。这时候绝对不能去「删了重建」：
+        # 客户端只要还开着共享里的文件，重建就会触发「是否强制关闭文件」
+        # 的确认，无头进程答不上来就直接失败（用户看到的那句黄字）。
+        return True, "共享已是最新，无需改动"
 
     def smb_diagnose(self):
         """SMB 能否被局域网其它机器访问的体检结果。"""
