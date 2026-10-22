@@ -13,7 +13,7 @@ AUTHOR = "by zhb"
 AUTHOR_TAG = "zhb"
 APP_NAME = "文件共享中心"
 APP_SUB = "局域网文件共享 · HTTP / FTP / SMB"
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 
 def window_title():

@@ -29,7 +29,7 @@ class ShareManager(object):
         self.traffic = TrafficMonitor()
         self.up_limiter = RateLimiter(0)      # 服务端对外发送（别人下载）
         self.dl_limiter = RateLimiter(0)      # 内置下载器
-        self.smb = smb.SmbManager(self.log)
+        self.smb = smb.SmbManager(self.log, cfg=cfg)
         self.http = None
         self.ftp = None
         self._lock = threading.RLock()
@@ -197,6 +197,20 @@ class ShareManager(object):
             return True, "已停止"
 
     # ------------------------------------------------------------ SMB
+    def _smb_mode(self):
+        mode = (self.cfg.get("smb", "mode") or "everyone").strip().lower()
+        return mode if mode in ("everyone", "account") else "everyone"
+
+    def _smb_cred(self):
+        """账号模式的用户名/密码（界面可改）。"""
+        user = (self.cfg.get("smb", "user") or "FileShare").strip() or "FileShare"
+        pwd = self.cfg.get("smb", "password") or ""
+        if not pwd:
+            # 空密码在「账号模式」下必然连不上（系统禁止空密码网络登录），
+            # 给一个满足默认密码复杂度的兜底值，并在界面显示出来
+            pwd = "FileShare@123"
+        return user, pwd
+
     def sync_smb(self):
         ok, msg = self.smb.available()
         if not ok:
@@ -210,7 +224,7 @@ class ShareManager(object):
         # 不把这三件事办掉，共享建得再对，局域网其它机器也是「无法访问」。
         # 所以启用 SMB 时顺手做一遍（幂等，重复调用没有副作用）。
         try:
-            fixed, failed = self.smb.repair(self.shares(), readonly=readonly)
+            fixed, failed = self.smb_repair()
             for f in failed:
                 self.log.add("warn", "SMB 环境修复未完成：%s" % f, "SMB")
         except Exception as exc:                            # noqa: BLE001
@@ -226,19 +240,33 @@ class ShareManager(object):
     def smb_diagnose(self):
         """SMB 能否被局域网其它机器访问的体检结果。"""
         try:
-            return self.smb.diagnose(self.shares())
+            return self.smb.diagnose(self.shares(), mode=self._smb_mode())
         except Exception as exc:                            # noqa: BLE001
             self.log.add("err", "SMB 体检失败：%s" % exc, "SMB")
             return []
 
     def smb_repair(self):
-        """一键修复：建共享账户 + 放行 445 + 补目录权限。"""
+        """一键修复：按当前模式开通访问 + 放行 445 + 补目录权限。"""
         readonly = bool(self.cfg.get("smb", "readonly", default=True))
-        return self.smb.repair(self.shares(), readonly=readonly)
+        user, pwd = self._smb_cred()
+        return self.smb.repair(self.shares(), readonly=readonly,
+                               mode=self._smb_mode(), user=user, password=pwd)
 
     def stop_smb(self):
-        self.smb.remove_all()
-        self.log.add("info", "SMB 共享已移除", "SMB")
+        """取消共享：删共享 + 把加过的目录权限还原。"""
+        # 按当前模式算出「我们授过谁」，记录丢了也能兜底撤销
+        if self._smb_mode() == "everyone":
+            principals = ["Everyone"]
+        else:
+            principals = [self._smb_cred()[0]]
+        removed, failed = self.smb.remove_all(
+            restore=True, principals=principals,
+            paths=[s["path"] for s in self.shares()])
+        if failed:
+            self.log.add("warn", "SMB 权限还原部分失败：%s" % "；".join(failed[:2]),
+                         "SMB")
+        self.log.add("info", "SMB 共享已移除%s" % (
+            "，目录权限已还原（%d 项）" % len(removed) if removed else ""), "SMB")
         return True, "已移除"
 
     # ------------------------------------------------------------ 统一入口
@@ -287,7 +315,12 @@ class ShareManager(object):
             except Exception:                              # noqa: BLE001
                 pass
         try:
-            self.smb.remove_all()
+            # 退出也要还原权限：共享都没了还留着 Everyone 读写等于开后门
+            principals = (["Everyone"] if self._smb_mode() == "everyone"
+                          else [self._smb_cred()[0]])
+            self.smb.remove_all(
+                restore=True, principals=principals,
+                paths=[s["path"] for s in self.shares()])
         except Exception:                                  # noqa: BLE001
             pass
         try:
@@ -324,6 +357,9 @@ class ShareManager(object):
                    if smb_on else "\\\\%s" % ip,
             "error": self.last_error.get("smb", ""),
             "account": self.smb.account_state()[0],
+            "mode": self._smb_mode(),
+            "user": self._smb_cred()[0],
+            "password": self._smb_cred()[1],
             "issues": [],
         }
         st["ip"] = ip

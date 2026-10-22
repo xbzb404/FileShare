@@ -87,6 +87,7 @@ class App(object):
         self._smb_issues = None             # SMB 体检结果缓存（None = 未查）
         self._smb_busy = False
         self._smb_fixing = False
+        self._smb_last_repair = None        # (done, failed)，失败原因留在面板上
         self._dirty = True
         self._notice = ""
         self._notice_until = 0
@@ -972,6 +973,8 @@ class App(object):
         t = self.theme
         f = self.fonts
         admin = st["admin"]
+        mode = st["smb"].get("mode") or "everyone"
+        everyone = mode == "everyone"
 
         def draw():
             p.gap(2)
@@ -982,7 +985,8 @@ class App(object):
             p.c.create_text(p.x + T.px(56), p.y + T.px(3),
                             text="创建同名 Windows 共享（\\\\本机IP\\共享名）",
                             anchor="nw", font=f.body, fill=t["tx"])
-            p.y += T.px(34)
+            p.y += T.px(30)
+
             sw2 = Switch(p.c, f, t,
                          value=bool(self.cfg.get("smb", "readonly", default=True)),
                          command=lambda v: self._set_bool("smb", "readonly", v,
@@ -992,25 +996,56 @@ class App(object):
             p.c.create_text(p.x + T.px(56), p.y + T.px(3),
                             text="只读（关掉后局域网可写入）", anchor="nw",
                             font=f.body, fill=t["tx"])
-            p.y += T.px(36)
+            p.y += T.px(30)
+
+            # 免密只读开关：打开 = Everyone 权限，任何设备直接进
+            sw3 = Switch(p.c, f, t, value=everyone,
+                         command=self._set_smb_mode)
+            p.c.create_window(p.x, p.y, window=sw3, anchor="nw")
+            self._embedded.append(sw3)
+            p.c.create_text(p.x + T.px(56), p.y + T.px(3),
+                            text="免密只读（Everyone 权限，其它设备直接进，不用账号）",
+                            anchor="nw", font=f.body, fill=t["tx"])
+            p.y += T.px(32)
+
+            # 账号模式：用户名 / 密码可自定义
+            if not everyone:
+                p.c.create_text(p.x, p.y + T.px(6), text="用户名", anchor="nw",
+                                font=f.small, fill=t["tx3"])
+                eu = LineEntry(p.c, f, t, st["smb"].get("user") or "FileShare",
+                               width=13,
+                               command=lambda v: self._set_smb_cred("user", v))
+                p.c.create_window(p.x + T.px(76), p.y, window=eu, anchor="nw",
+                                  height=T.px(26))
+                self._embedded.append(eu)
+                p.c.create_text(p.x + T.px(210), p.y + T.px(6), text="密码",
+                                anchor="nw", font=f.small, fill=t["tx3"])
+                ep = LineEntry(p.c, f, t, st["smb"].get("password") or "",
+                               width=15,
+                               command=lambda v: self._set_smb_cred("password", v))
+                p.c.create_window(p.x + T.px(250), p.y, window=ep, anchor="nw",
+                                  height=T.px(26))
+                self._embedded.append(ep)
+                p.y += T.px(26)
+                p.body("改完点下方「修复局域网访问」生效。密码需满足系统复杂度"
+                       "（至少 8 位，含大小写/数字/符号更稳）。",
+                       color=t["tx3"], font=f.tiny)
+                p.y += T.px(20)
+
             if not admin:
                 p.body("当前不是管理员：SMB 共享需要管理员权限，"
                        "点右上角「以管理员身份重启」。", color=t["status_warn"],
                        font=f.small)
             elif st["smb"]["on"]:
                 p.mono_text(st["smb"]["url"], color=t["accent"])
-                acct = st["smb"].get("account") or ""
-                if acct and acct != "Guest":
-                    p.body("局域网其它机器访问时，用户名 %s，密码 %s"
-                           % (acct, "fileshare"), color=t["tx2"], font=f.small)
-                elif acct == "Guest":
-                    p.body("当前靠 Guest 来宾账户访问 —— 多数系统默认禁用来宾，"
-                           "连不上请点下方「修复局域网访问」。",
-                           color=t["status_warn"], font=f.small)
+                if everyone:
+                    p.body("其它设备直接打开上面的地址即可，不用输入账号密码。",
+                           color=t["tx2"], font=f.small)
                 else:
-                    p.body("没有任何可用的登录账户：别的机器连过来会直接报"
-                           "「无法访问」。点下方「修复局域网访问」。",
-                           color=t["status_warn"], font=f.small)
+                    p.body("其它机器访问时输入用户名 %s、密码 %s"
+                           % (st["smb"].get("user") or "FileShare",
+                              st["smb"].get("password") or ""),
+                           color=t["tx2"], font=f.small)
             if st["smb"].get("error"):
                 p.body(st["smb"]["error"], color=t["status_warn"], font=f.tiny)
 
@@ -1020,22 +1055,21 @@ class App(object):
             if issues is None:
                 p.gap(6)
                 p.body("正在检查局域网访问条件…", color=t["tx3"], font=f.tiny)
-            elif not issues:
-                p.gap(6)
-                p.body("✓ 局域网访问条件正常：其它机器可以直接打开上面的地址。",
-                       color=t["status_ok"], font=f.small)
             else:
-                p.gap(8)
                 errs = [i for i in issues if i["level"] == "error"]
-                warns = [i for i in issues if i["level"] != "error"]
-                p.body("发现 %d 个问题（%d 个会导致完全连不上）"
-                       % (len(issues), len(errs)), color=t["status_warn"],
-                       font=f.small)
-                for it in issues:
-                    col = (t["status_bad"] if it["level"] == "error"
-                           else t["status_warn"])
-                    p.c.create_text(p.x, p.y, text="· " + it["title"], anchor="nw",
-                                    font=f.small, fill=col,
+                real = [i for i in issues if i.get("fixable")]
+                if not errs:
+                    p.gap(6)
+                    p.body("✓ 局域网访问条件正常：其它机器可以直接打开上面的地址。",
+                           color=t["status_ok"], font=f.small)
+                else:
+                    p.gap(8)
+                    p.body("发现 %d 个会导致完全连不上的问题" % len(errs),
+                           color=t["status_warn"], font=f.small)
+                for it in (errs if errs else []):
+                    p.c.create_text(p.x, p.y, text="· " + it["title"],
+                                    anchor="nw", font=f.small,
+                                    fill=t["status_bad"],
                                     width=p.w - T.px(80))
                     p.y += T.px(20)
                     if it.get("detail"):
@@ -1043,17 +1077,41 @@ class App(object):
                                         anchor="nw", font=f.tiny, fill=t["tx3"],
                                         width=p.w - T.px(96))
                         p.y += T.px(18) * max(1, 1 + len(it["detail"]) // 46)
-                if any(i.get("fixable") for i in issues):
+
+                # 上次修复失败的原因要留在界面上，不能只闪一下 toast
+                last = getattr(self, "_smb_last_repair", None)
+                if last:
+                    done, failed = last
+                    p.gap(4)
+                    if failed:
+                        p.body("上次修复 %d 项成功，%d 项失败：" % (
+                            len(done), len(failed)), color=t["status_bad"],
+                            font=f.tiny)
+                        for msg in failed[:4]:
+                            p.c.create_text(p.x + T.px(12), p.y, text="· " + msg,
+                                            anchor="nw", font=f.tiny,
+                                            fill=t["tx3"],
+                                            width=p.w - T.px(96))
+                            p.y += T.px(18) * max(1, 1 + len(msg) // 40)
+                    else:
+                        p.body("上次修复：%d 项全部成功" % len(done),
+                               color=t["status_ok"], font=f.tiny)
+
+                if issues and (real or last):
                     bh = T.px(32)
                     p.button(p.x, p.y + T.px(4), T.px(160), bh,
                              "修复局域网访问", self._smb_repair, "primary",
                              font=f.small)
                     p.y += bh + T.px(12)
+                    hint = ("修复会：开启免密访问（Guest）、放行 TCP 445、"
+                            "给共享目录授 Everyone 读权限。"
+                            if everyone else
+                            "修复会：创建/更新共享账户 %s、放行 TCP 445、"
+                            "给共享目录授该账户读权限。"
+                            % (st["smb"].get("user") or "FileShare"))
                     p.c.create_text(
                         p.x, p.y,
-                        text="修复会：创建专用共享账户（FileShare / fileshare）、"
-                             "放行 TCP 445、给共享目录补读权限。只动局域网共享"
-                             "相关设置，不改其它系统配置。",
+                        text=hint + "取消共享时会自动把这些权限还原。",
                         anchor="nw", font=f.tiny, fill=t["tx3"],
                         width=p.w - T.px(20))
                     p.y += T.px(16) * 2
@@ -1061,6 +1119,28 @@ class App(object):
             p.body("Windows 自带的 SMB 是内核态实现，局域网大文件传输比 HTTP 还快，"
                    "适合当网盘用。", color=t["tx3"], font=f.tiny)
         p.card(draw, pad=16)
+
+    def _set_smb_mode(self, everyone):
+        """切换免密 / 账号模式。已在共享中时立刻按新模式重做一遍。"""
+        self.cfg.set("everyone" if everyone else "account", "smb", "mode")
+        self.cfg.save()
+        self._smb_issues = None
+        self._smb_last_repair = None
+        self._toast("已切换为%s模式" % ("免密只读" if everyone else "账号密码"))
+        if self.manager.is_running("smb"):
+            # 已在共享中：按新模式重做授权（_smb_repair 自己会置忙标志）
+            self._smb_repair()
+        else:
+            self.render_page()
+
+    def _set_smb_cred(self, key, value):
+        """改共享账户用户名/密码（落盘，重启后仍生效）。"""
+        value = (value or "").strip()
+        if key == "user" and (not value or " " in value):
+            return                      # 用户名不能空、不能带空格
+        self.cfg.set(value, "smb", key)
+        self.cfg.save()
+        self._smb_issues = None
 
     def _nic_label(self):
         """一句话说清当前用的哪块网卡、协商速率多少。"""
@@ -2499,9 +2579,10 @@ class App(object):
         elif kind == "smb-repair":
             _k, done, failed = msg
             self._smb_fixing = False
+            self._smb_last_repair = (list(done), list(failed))
             if failed:
-                self._toast("SMB 修复完成 %d 项，%d 项失败" % (len(done),
-                                                              len(failed)))
+                self._toast("SMB 修复完成 %d 项，%d 项失败（原因见面板）"
+                            % (len(done), len(failed)))
             else:
                 self._toast("SMB 修复完成：%d 项全部成功" % len(done))
             self._smb_issues = None        # 让界面重查一次

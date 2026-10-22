@@ -1090,21 +1090,109 @@ class TestSmbDiagnose(unittest.TestCase):
         # 所以把权限门放开，别让 is_admin() 的环境差异干扰断言
         m.available = lambda: (True, "OK")
         try:
-            done, failed = m.repair([{"name": "s", "path": d}])
+            done, failed = m.repair([{"name": "s", "path": d}],
+                                    mode="account", user="FileShare",
+                                    password="MyPass@2026")
             self.assertEqual([], failed, failed)
             flat = [" ".join(c) for c in self.calls if c and c[0] != "PS"]
-            # 建了账户
-            self.assertTrue(any("/add" in c and "FileShare" in c for c in flat),
-                            "没有创建共享账户")
+            # 建了账户，且用的是自定义密码
+            self.assertTrue(any("/add" in c and "MyPass@2026" in c for c in flat),
+                            "没有用自定义密码创建账户：%s" % flat)
             # 放行了 445
             self.assertTrue(any("advfirewall" in c and "445" in c for c in flat),
                             "没有放行 445")
-            # 给目录授权用的是 FileShare 账户，而不是 Everyone
-            icacls = [c for c in flat if c.startswith("icacls")]
-            self.assertTrue(icacls, "没有给目录授权")
-            self.assertTrue(all("FileShare" in c for c in icacls),
-                            "应当只授给专用账户：%s" % icacls)
-            self.assertTrue(any("445" in d or True for d in flat))
+            # 授权命令（/grant）用的是 FileShare 账户，而不是 Everyone
+            grants = [c for c in flat if "/grant" in c]
+            self.assertTrue(grants, "没有给目录授权")
+            self.assertTrue(all("FileShare" in c for c in grants),
+                            "应当只授给专用账户：%s" % grants)
+            self.assertTrue(all("Everyone" not in c for c in grants),
+                            "账号模式不该给 Everyone 授权：%s" % grants)
+        finally:
+            import shutil
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_repair_everyone_mode(self):
+        """免密模式：开 Guest、不建账户、目录授权 Everyone。"""
+        import tempfile
+        d = tempfile.mkdtemp(prefix="fs_smb_ev_")
+
+        def run(args, timeout=20):
+            self.calls.append(list(args))
+            if args[:2] == ["net", "user"] and len(args) == 3:
+                name = args[2]
+                if name == "Guest":
+                    return 0, "帐户启用    Yes"
+                return 2, "找不到用户名。"
+            return 0, ""
+
+        m = self._mgr(run_reply=run)
+
+        def ps(script, timeout=30):
+            # 防火墙检测要返回「已放行」，Guest 策略查询返回 0（允许空密码）
+            if "Get-NetFirewallRule" in script:
+                return 0, "OPEN:测试规则"
+            return 0, "0"
+
+        m._ps = ps
+        m.available = lambda: (True, "OK")
+        try:
+            done, failed = m.repair([{"name": "s", "path": d}], mode="everyone")
+            self.assertEqual([], failed, failed)
+            flat = [" ".join(c) for c in self.calls if c and c[0] != "PS"]
+            # 开了 Guest
+            self.assertTrue(any("net user Guest /active:yes" in c for c in flat),
+                            "没有启用 Guest：%s" % flat)
+            # 不该建专用账户
+            self.assertFalse(any("/add" in c for c in flat),
+                             "免密模式不该创建账户：%s" % flat)
+            # 授权 Everyone
+            grants = [c for c in flat if "/grant" in c]
+            self.assertTrue(grants and all("S-1-1-0" in c or "Everyone" in c
+                                           for c in grants),
+                            "免密模式应当授权 Everyone：%s" % grants)
+        finally:
+            import shutil
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_cancel_share_restores_acl(self):
+        """取消共享要把加过的目录权限还原（并发 /remove:g）。"""
+        import tempfile
+        d = tempfile.mkdtemp(prefix="fs_smb_rev_")
+
+        def run(args, timeout=20):
+            self.calls.append(list(args))
+            return 0, ""
+
+        m = self._mgr(run_reply=run)
+        m.granted = [[d, "Everyone"]]
+        try:
+            done, failed = m.revoke_all()
+            self.assertEqual([], failed, failed)
+            self.assertTrue(done, "没有执行还原")
+            flat = [" ".join(c) for c in self.calls]
+            self.assertTrue(any("/remove:g" in c and "S-1-1-0" in c for c in flat),
+                            "没有撤销 Everyone 的 ACE：%s" % flat)
+            self.assertEqual([], m.granted, "还原后记录应当清空")
+        finally:
+            import shutil
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_inherited_acl_not_touched(self):
+        """继承来的 Everyone 权限不能被当成「我们加的」撤掉。"""
+        import tempfile
+        d = tempfile.mkdtemp(prefix="fs_smb_inh_")
+
+        def run(args, timeout=20):
+            # 模拟继承：ACL 行带 (I) 标记
+            if args[:1] == ["icacls"] and len(args) == 2:
+                return 0, "%s Everyone:(I)(OI)(CI)(RX)\n" % d
+            return 0, ""
+
+        m = self._mgr(run_reply=run)
+        try:
+            self.assertFalse(m.has_explicit_grant(d, "Everyone"),
+                             "继承来的 ACE 不应被判为显式授权")
         finally:
             import shutil
             shutil.rmtree(d, ignore_errors=True)

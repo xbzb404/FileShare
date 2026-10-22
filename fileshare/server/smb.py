@@ -42,10 +42,30 @@ class SmbError(Exception):
 
 
 class SmbManager(object):
-    def __init__(self, log=None):
+    def __init__(self, log=None, cfg=None):
         self.log = log
+        self.cfg = cfg
         self.managed = set()          # 本程序创建的共享名，退出时只删这些
         self.account = ""             # 上次修复用的共享账户名（空 = 未配置）
+        # 本程序给目录加过的授权 → [[路径, 身份]]，取消共享时按它还原。
+        # 必须落盘：程序重启后还能把上次加的权限撤掉。
+        self.granted = []
+        self._last_paths = []         # 本次进程里处理过的共享目录
+        if cfg is not None:
+            try:
+                self.granted = [list(x) for x in
+                                (cfg.get("smb", "granted") or []) if len(x) == 2]
+            except Exception:                               # noqa: BLE001
+                self.granted = []
+
+    def _save_granted(self):
+        if self.cfg is None:
+            return
+        try:
+            self.cfg.set([list(x) for x in self.granted], "smb", "granted")
+            self.cfg.save()
+        except Exception:                                   # noqa: BLE001
+            pass
 
     # ------------------------------------------------------------ 环境
     def available(self):
@@ -122,12 +142,19 @@ class SmbManager(object):
     def grant_ntfs(self, path, readonly=True, account=None):
         """给共享目录授权，让局域网账户能读到文件。
 
-        ``account=None`` 时授权给 Everyone（用户显式选了「无密码访问」）；
+        ``account=None`` → 授权给 Everyone（免密模式）；
         否则只授给专用共享账户 —— 共享权限的 Everyone 是粗粒度开关，
         真正的细粒度拦截放在这里，比全目录放开安全得多。
+
+        已经能访问就不重复加 ACE（否则取消共享时无法区分「本来就有」
+        还是「我们加的」，还原权限会误删用户自己的授权）。
         """
         if not os.path.isdir(path):
             return False, "目录不存在"
+        if path not in self._last_paths:
+            self._last_paths.append(path)
+        if self._ntfs_allows(path, account):
+            return True, "已有权限，无需改动"
         who = account or "Everyone"
         grant = "(OI)(CI)(RX)" if readonly else "(OI)(CI)(M)"
         principal = SID_EVERYONE if not account else account
@@ -135,7 +162,102 @@ class SmbManager(object):
                              "%s:%s" % (principal, grant)])
         if rc != 0:
             return False, _clean(out) or "icacls 返回 %d" % rc
+        self._remember(path, who)
         return True, "已授权 %s %s" % (who, "只读" if readonly else "读写")
+
+    def _remember(self, path, principal):
+        item = [os.path.normpath(path), principal]
+        if item not in self.granted:
+            self.granted.append(item)
+            self._save_granted()
+
+    def revoke_ntfs(self, path, principal):
+        """撤掉本程序加的某条 ACE（还原权限）。"""
+        if not os.path.isdir(path):
+            return False, "目录不存在"
+        target = SID_EVERYONE if str(principal).lower() in ("everyone",
+                                                            "s-1-1-0") \
+            else principal
+        rc, out = self._run(["icacls", path, "/remove:g", target])
+        return rc == 0, _clean(out) or ""
+
+    def has_explicit_grant(self, path, principal):
+        """目录里是否有**显式**（非继承）授给 ``principal`` 的 ACE。
+
+        用来判断「这条权限是不是本程序加的」：icacls 里继承来的权限带
+        ``(I)`` 标记，我们手动 ``/grant`` 加的不带。取消共享时只撤显式
+        的那些，不会把用户自己从上层目录继承的权限删掉。
+        """
+        rc, out = self._run(["icacls", path])
+        if rc != 0:
+            return False
+        target = str(principal).lower()
+        host = (os.environ.get("COMPUTERNAME") or "").lower()
+
+        def norm(s):
+            return s.replace("\\", "/").lower()
+
+        prefix = norm(os.path.normpath(path))
+        for line in out.replace("\r", "").split("\n"):
+            text = norm(line).strip()
+            if text.startswith(prefix):
+                text = text[len(prefix):]
+            for m in re.finditer(r"([^()]+?):\(([^)]*)\)", text):
+                who = m.group(1).strip().lstrip("*")
+                flags = m.group(2)
+                if "i" == flags.lower() or "(i)" in flags.lower():
+                    continue            # 继承来的，不是我们加的
+                if who == target or who == "%s/%s" % (host, target) \
+                        or (target in ("everyone", "s-1-1-0")
+                            and who in ("everyone", "s-1-1-0")):
+                    return True
+        return False
+
+    def revoke_all(self, principals=None, paths=None):
+        """取消共享时把本程序加过的目录权限全部还原。
+
+        ``principals`` 给定时（按当前模式算出 Everyone / 账户名），
+        即使记录丢了也能尝试撤销显式 ACE —— 只要确认是「显式」而非继承，
+        就不会误删用户自己的权限。``paths`` 是本次共享的目录（调用方给），
+        这样连「从没点过修复、但上次运行授权过」的老权限也能还原。
+        """
+        done, failed = [], []
+        todo = list(self.granted)
+        # 兜底：记录里没有、但确实存在显式 ACE 的也补上（老版本授权过、
+        # 或程序重装后 granted 为空的情况）
+        if principals:
+            scan = list(paths or []) + list(self._last_paths)
+            seen = set()
+            for path in scan:
+                if not path or not os.path.isdir(path):
+                    continue
+                key = os.path.normpath(path).lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                for pr in principals:
+                    if self.has_explicit_grant(path, pr) \
+                            and [os.path.normpath(path), pr] not in todo:
+                        todo.append([os.path.normpath(path), pr])
+
+        for path, principal in todo:
+            ok, why = self.revoke_ntfs(path, principal)
+            name = "%s（%s）" % (os.path.basename(path.rstrip("\\/")) or path,
+                                 principal)
+            if ok:
+                if [path, principal] in self.granted:
+                    self.granted.remove([path, principal])
+                done.append(name)
+            else:
+                failed.append("%s%s" % (name, "：" + why if why else ""))
+        if done:
+            self._save_granted()
+        if self.log is not None:
+            for d in done:
+                self.log.add("ok", "SMB 权限已还原：%s" % d, "SMB")
+            for f in failed:
+                self.log.add("warn", "SMB 权限还原失败：%s" % f, "SMB")
+        return done, failed
 
     def _acl_grants(self, path):
         """目录 ACL 里被授权的身份集合（统一小写便于比较）。
@@ -171,50 +293,103 @@ class SmbManager(object):
 
     def _ntfs_allows(self, path, account=None):
         """``account``（或 Everyone）能否读这个目录。"""
-        who = self._acl_grants(path)
+        who = self._acl_grants(path)          # 已统一成小写 + 正斜杠
         # SID 形式的 Everyone 解析后是 s-1-1-0（前缀的 * 已在解析时剥掉）
-        if "s-1-1-0" in who or "everyone" in who \
-                or "*s-1-1-0" in who:
+        if "s-1-1-0" in who or "everyone" in who or "*s-1-1-0" in who:
             return True
         if account:
             low = account.lower()
             if low in who:
                 return True
+            # icacls 会把本地账户输出成 "主机名\账户名"，而 who 里的分隔符
+            # 已统一成正斜杠 —— 拼的时候也必须用正斜杠，否则永远不相等
+            # （踩过：授权明明成功，界面却一直报「NTFS 没放给访问者」）
             host = (os.environ.get("COMPUTERNAME") or "").lower()
-            if host and ("%s\\%s" % (host, low)) in who:
+            if host and ("%s/%s" % (host, low)) in who:
                 return True
         # 本机 Users 组覆盖不到网络来宾，必须显式授权才算
         return False
 
     # ------------------------------------------------------------ 账户
-    def ensure_account(self, password=SHARE_PASS):
+    def ensure_account(self, user=SHARE_USER, password=SHARE_PASS):
         """建/修专用共享账户，返回 ``(ok, 说明, 账户名)``。
 
-        幂等：已存在就把密码重置回已知值（用户改过密码也能连上）、
-        确保启用、密码永不过期。
+        幂等：已存在就把密码重置成用户设定的值、确保启用、密码永不过期。
+        用户名/密码都由界面传入，默认值只是兜底。
         """
-        rc, out = self._run(["net", "user", SHARE_USER])
+        user = (user or SHARE_USER).strip()
+        password = password or SHARE_PASS
+        rc, out = self._run(["net", "user", user])
         created = rc != 0
         if created:
             rc, out = self._run([
-                "net", "user", SHARE_USER, password, "/add",
+                "net", "user", user, password, "/add",
                 "/comment:文件共享中心 · 局域网共享账户",
                 "/fullname:FileShare LAN",
             ])
             if rc != 0:
-                return False, "创建账户失败：%s" % (_clean(out) or rc), ""
-            msg = "已创建共享账户 %s" % SHARE_USER
+                # 最常见：密码不满足本机密码策略（长度/复杂度）
+                return False, "创建账户失败：%s" % (
+                    _clean(out) or rc), ""
+            msg = "已创建共享账户 %s" % user
         else:
-            # 已存在：重置密码（幂等），并确保启用
-            self._run(["net", "user", SHARE_USER, password])
-            msg = "共享账户 %s 已存在，密码已重置" % SHARE_USER
+            # 已存在：把密码同步成界面上的值（幂等）
+            rc2, out2 = self._run(["net", "user", user, password])
+            if rc2 != 0:
+                return False, "重置密码失败：%s" % (
+                    _clean(out2) or rc2), ""
+            msg = "共享账户 %s 已存在，密码已更新" % user
 
-        self._run(["net", "user", SHARE_USER, "/active:yes"])
+        self._run(["net", "user", user, "/active:yes"])
         # 密码永不过期：否则几个月后所有客户端突然连不上
         self._ps("Set-LocalUser -Name '%s' -PasswordNeverExpires $true "
-                 "-ErrorAction SilentlyContinue" % SHARE_USER)
-        self.account = SHARE_USER
-        return True, msg, SHARE_USER
+                 "-ErrorAction SilentlyContinue" % user)
+        self.account = user
+        return True, msg, user
+
+    # ------------------------------------------------------------ 免密模式
+    def guest_state(self):
+        """免密访问所需条件 → ``(ok, 缺什么)``。
+
+        免密 = 别的机器不带凭据直连。Windows 要走通这条路，光给目录
+        授权不够，还得让「空凭据」能登录成一个真实会话：
+        * ``Guest`` 账户启用 —— 匿名连接会被映射到它；
+        * ``LimitBlankPasswordUse=0`` —— 否则 Guest 的空密码在网络登录时被拒。
+        """
+        rc, out = self._run(["net", "user", "Guest"])
+        if rc != 0:
+            return False, "系统里没有 Guest 账户"
+        enabled = False
+        for line in out.splitlines():
+            if "启用" in line or "account active" in line.lower():
+                tail = (line.split() or [""])[-1].lower()
+                enabled = tail not in ("no", "否")
+        if not enabled:
+            return False, "Guest 来宾账户被禁用"
+        rc, out = self._ps(
+            "(Get-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Lsa')"
+            ".LimitBlankPasswordUse", timeout=20)
+        if rc == 0 and out.strip() == "1":
+            return False, "系统禁止空密码网络登录（LimitBlankPasswordUse=1）"
+        return True, "免密访问条件已就绪"
+
+    def enable_guest_access(self):
+        """打开免密访问所需的系统开关（幂等）。"""
+        rc, out = self._run(["net", "user", "Guest", "/active:yes"])
+        if rc != 0:
+            return False, "启用 Guest 失败：%s" % (_clean(out) or rc)
+        # 允许空密码账户从网络登录（Guest 就是空密码）
+        self._ps("Set-ItemProperty -Path "
+                 "'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Lsa' "
+                 "-Name LimitBlankPasswordUse -Value 0 -Type DWord", timeout=25)
+        # 让匿名登录的身份包含 Everyone，否则 NTFS 的 Everyone 授权
+        # 对匿名会话不生效，对方连上仍然读不到文件
+        self._ps("Set-ItemProperty -Path "
+                 "'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Lsa' "
+                 "-Name EveryoneIncludesAnonymous -Value 1 -Type DWord",
+                 timeout=25)
+        ok, why = self.guest_state()
+        return ok, ("已开启免密访问" if ok else "免密访问未完全生效：%s" % why)
 
     def account_state(self):
         """当前可用于局域网登录的账户 → ``(账户名, 说明)``；没有则 ``("", 原因)``。"""
@@ -307,7 +482,7 @@ if ($hit.Count -gt 0) { 'OPEN:' + (($hit | Sort-Object -Unique) -join ';') } els
         return False, "445 入站未放行（其它机器会被防火墙拦住）"
 
     # ------------------------------------------------------------ 诊断
-    def diagnose(self, shares=None):
+    def diagnose(self, shares=None, mode="account"):
         """体检「别人能不能连进来」，返回问题清单。
 
         每项 ``{key, level, title, detail, fixable}``：``error`` = 一定连不上，
@@ -349,16 +524,27 @@ if ($hit.Count -gt 0) { 'OPEN:' + (($hit | Sort-Object -Unique) -join ';') } els
                 "fixable": True,
             })
 
-        # 4) 登录账户
-        account, why = self.account_state()
-        if not account:
-            issues.append({
-                "key": "account", "level": "error",
-                "title": "没有任何可用的网络登录账户",
-                "detail": "%s。别的机器连过来会直接报「无法访问」，"
-                          "连用户名密码框都不弹。" % why,
-                "fixable": True,
-            })
+        # 4) 登录方式（免密模式看 Guest，账号模式看专用账户）
+        if mode == "everyone":
+            guest_ok, why = self.guest_state()
+            if not guest_ok:
+                issues.append({
+                    "key": "guest", "level": "error",
+                    "title": "免密（Everyone）访问条件不满足",
+                    "detail": "%s。别的机器不带账号密码连过来会直接被拒。" % why,
+                    "fixable": True,
+                })
+            account = None
+        else:
+            account, why = self.account_state()
+            if not account:
+                issues.append({
+                    "key": "account", "level": "error",
+                    "title": "没有任何可用的网络登录账户",
+                    "detail": "%s。别的机器连过来会直接报「无法访问」，"
+                              "连用户名密码框都不弹。" % why,
+                    "fixable": True,
+                })
 
         # 5) 目录 NTFS 权限（真问题：连上了但读不到文件）
         bad_dirs = []
@@ -366,7 +552,7 @@ if ($hit.Count -gt 0) { 'OPEN:' + (($hit | Sort-Object -Unique) -join ';') } els
             path = s.get("path") if isinstance(s, dict) else s
             if not path or not os.path.isdir(path):
                 continue
-            if not self._ntfs_allows(path, account or None):
+            if not self._ntfs_allows(path, account):
                 bad_dirs.append(path)
         if bad_dirs:
             issues.append({
@@ -389,14 +575,15 @@ if ($hit.Count -gt 0) { 'OPEN:' + (($hit | Sort-Object -Unique) -join ';') } els
                 "fixable": False,
             })
 
-        # 7) 客户端只读到共享列表的情况：检查 Guest 空密码策略组合
-        if account == "Guest":
+        # 7) 免密模式的客户端兼容性提醒
+        if mode == "everyone":
             issues.append({
-                "key": "guest", "level": "warn",
-                "title": "当前靠 Guest 来宾账户访问",
-                "detail": "很多系统的组策略会强制禁用来宾登录，不稳定；"
-                          "建议改用专用共享账户。",
-                "fixable": True,
+                "key": "guest-client", "level": "warn",
+                "title": "免密访问对内网设备最方便，但部分 Windows 客户端会拦",
+                "detail": "Win10/11 默认拒绝「不安全的来宾登录」，对方可能提示"
+                          "「安全策略阻止未经身份验证的来宾访问」。遇到时改用"
+                          "账号模式（关闭「免密只读」后设账号密码）。",
+                "fixable": False,
             })
         return issues
 
@@ -407,8 +594,15 @@ if ($hit.Count -gt 0) { 'OPEN:' + (($hit | Sort-Object -Unique) -join ';') } els
                 for n in self.managed if all_shares.get(n)]
 
     # ------------------------------------------------------------ 一键修复
-    def repair(self, shares=None, readonly=True, password=SHARE_PASS):
-        """按诊断结果修复，返回 ``(done, failed)``。"""
+    def repair(self, shares=None, readonly=True, mode="account",
+               user=SHARE_USER, password=SHARE_PASS):
+        """按诊断结果修复，返回 ``(done, failed)``。
+
+        两种模式：
+        * ``everyone``（免密只读）：开 Guest + 允许空密码网络登录 +
+          目录授权 Everyone；
+        * ``account``：建专用账户（用户名密码由界面给）+ 只授权该账户。
+        """
         ok, msg = self.available()
         if not ok:
             return [], [msg]
@@ -427,7 +621,14 @@ if ($hit.Count -gt 0) { 'OPEN:' + (($hit | Sort-Object -Unique) -join ';') } els
             (done if good else failed).append(
                 "%s（%s）" % (name, why) if why else name)
 
-        step("创建/修复共享账户", lambda: self.ensure_account(password)[:2])
+        if mode == "everyone":
+            step("开启免密访问（Guest）", self.enable_guest_access)
+            principal = None
+        else:
+            step("创建/修复共享账户",
+                 lambda: self.ensure_account(user, password)[:2])
+            principal = (user or SHARE_USER).strip()
+
         step("放行 TCP 445", self.firewall_open)
 
         targets = list(shares if shares is not None else self._managed_shares())
@@ -437,7 +638,7 @@ if ($hit.Count -gt 0) { 'OPEN:' + (($hit | Sort-Object -Unique) -join ';') } els
                 continue
             label = "授权 %s" % os.path.basename(path.rstrip("\\/"))
             step(label, lambda p=path: self.grant_ntfs(
-                p, readonly=readonly, account=SHARE_USER))
+                p, readonly=readonly, account=principal))
 
         if self.log is not None:
             for d in done:
@@ -480,13 +681,22 @@ if ($hit.Count -gt 0) { 'OPEN:' + (($hit | Sort-Object -Unique) -join ';') } els
                 self.log.add("err", "SMB 失败：%s" % err, "SMB")
         return done, errors
 
-    def remove_all(self):
-        """退出时清掉本程序建的共享（账户留着，下次还要用）。"""
+    def remove_all(self, restore=True, principals=None):
+        """取消共享：删掉本程序建的共享，并把加过的目录权限还原。
+
+        ``restore=True`` 时会把 ``grant_ntfs`` 记录过的 ACE 逐条撤掉——
+        共享都取消了还留着 Everyone/共享账户的读写权限，等于给整机开了
+        一个长期后门。账户和防火墙规则保留（前者没有目录权限就进不来，
+        后者下次开共享还要用，反复改防火墙反而容易出错）。
+        """
         for name in list(self.managed):
             try:
                 self.remove(name)
             except SmbError:
                 pass
+        if restore:
+            return self.revoke_all(principals)
+        return [], []
 
 
 def _clean(text):
