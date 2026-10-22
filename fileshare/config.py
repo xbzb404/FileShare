@@ -66,7 +66,7 @@ DEFAULTS = {
         "readonly": True,
         # everyone = 免密只读（Everyone 权限，任何设备直接进）
         # account  = 用专用本地账户，需输入用户名密码
-        "mode": "everyone",
+        "mode": "account",
         "user": "FileShare",
         "password": "",
         "granted": [],       # 本程序加过的目录授权，取消共享时按它还原

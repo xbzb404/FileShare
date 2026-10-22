@@ -1018,6 +1018,8 @@ class TestSmbDiagnose(unittest.TestCase):
                 return 0, "  TCP    0.0.0.0:445    0.0.0.0:0    LISTENING    4"
             if args[:2] == ["net", "user"] and len(args) > 2:
                 return 0, "帐户启用    Yes"
+            if args[:2] == ["net", "use"]:
+                return 0, "命令成功完成。"          # 网络登录验证通过
             if args[0] == "icacls":
                 # 用真实目录路径，模拟 icacls 真实输出格式
                 return 0, "%s *S-1-1-0:(I)(RX)\n" % d
@@ -1337,3 +1339,152 @@ class TestSmbShareNoop(unittest.TestCase):
         self.assertEqual(0, rc)
         self.assertEqual(subprocess.DEVNULL, captured.get("stdin"),
                          "stdin 没给 DEVNULL，交互式命令会读不到输入")
+
+
+class TestSmbLogonCheck(unittest.TestCase):
+    """网络登录验证：账户存在 ≠ 别的机器连得上。
+
+    用户现场：对方机器弹「输入网络凭据」，怎么输都不对。实测发现这台机器
+    把 Guest 放进「拒绝从网络访问这台计算机」，来宾登录报 1385；而用
+    FileShare/fileshare 走 IPC$ 是能登上的。所以体检必须真的连一次。
+    """
+
+    def _mgr(self, logon_rc, logon_out=""):
+        from fileshare.server.smb import SmbManager
+        m = SmbManager()
+
+        def fake(args, timeout=20):
+            if args[:2] == ["net", "use"]:
+                return logon_rc, logon_out
+            if args[:2] == ["net", "user"]:
+                return 0, "帐户启用    Yes"
+            if args[:2] == ["net", "share"]:
+                return 0, "共享名       s\n路径         E:\\Fshare\n"
+            if args[0] == "icacls":
+                return 0, "E:\\Fshare *S-1-1-0:(I)(RX)\n"
+            return 0, ""
+
+        m._run = fake
+        m._ps = lambda script, timeout=30: (0, "OPEN:文件和打印机共享(SMB-In)")
+        return m
+
+    def test_test_logon_parses_error_code(self):
+        m = self._mgr(2, "发生系统错误 1385。\n\n"
+                         "登录失败: 未授予用户在此计算机上的请求登录类型。")
+        ok, why, code = m.test_logon("Guest", "")
+        self.assertFalse(ok)
+        self.assertEqual(1385, code)
+        self.assertIn("拒绝从网络访问", why)
+
+    def test_test_logon_success(self):
+        m = self._mgr(0, "命令成功完成。")
+        ok, why, code = m.test_logon("FileShare", "fileshare")
+        self.assertTrue(ok)
+        self.assertEqual(0, code)
+
+    def test_test_logon_cleans_session_first(self):
+        """不能因为上一条凭据还被缓存着（错误 1219）就误判。"""
+        calls = []
+
+        def fake(args, timeout=20):
+            calls.append(list(args))
+            return 0, "命令成功完成。"
+
+        m = self._mgr(0)
+        m._run = fake
+        m.test_logon("FileShare", "fileshare")
+        uses = [c for c in calls if c[:2] == ["net", "use"]]
+        self.assertTrue(uses[0][-2:] == ["/delete", "/y"] or "/delete" in uses[0],
+                        "登录验证前应先断开已有会话：%s" % uses[0])
+
+    def test_diagnose_flags_bad_password(self):
+        m = self._mgr(2, "发生系统错误 1326。\n\n用户名或密码不正确。")
+        issues = m.diagnose([], mode="account", user="FileShare", password="x")
+        keys = {i["key"]: i for i in issues}
+        self.assertIn("logon", keys)
+        self.assertTrue(keys["logon"]["fixable"], "密码错可以通过重置账户修好")
+        self.assertIn("密码", keys["logon"]["title"])
+
+    def test_diagnose_guest_blocked_not_fixable(self):
+        m = self._mgr(2, "发生系统错误 1385。")
+        issues = m.diagnose([], mode="everyone")
+        keys = {i["key"]: i for i in issues}
+        self.assertIn("guest", keys)
+        self.assertFalse(keys["guest"]["fixable"],
+                         "这是安全策略，程序不该假装能修")
+        self.assertIn("1385", keys["guest"]["detail"])
+
+    def test_default_mode_is_account(self):
+        """默认必须是账号模式：免密在多数 Win10/11 上根本走不通。"""
+        from fileshare.config import Config
+        import tempfile
+        import os
+        d = tempfile.mkdtemp(prefix="fs_cfg_")
+        try:
+            cfg = Config(path=os.path.join(d, "config.json"))
+            self.assertEqual("account", cfg.get("smb", "mode"))
+        finally:
+            import shutil
+            shutil.rmtree(d, ignore_errors=True)
+
+
+class TestSmbModeFallback(unittest.TestCase):
+    """免密模式被安全策略堵死时要自动换成账号模式。
+
+    否则用户开着 SMB、界面也没红字，但别的机器永远卡在「输入网络凭据」——
+    这正是 v1.1.2 之前的状态。
+    """
+
+    def test_auto_switch_when_guest_blocked(self):
+        import os
+        import shutil
+        import tempfile
+
+        from fileshare.config import Config
+        from fileshare.server.manager import ShareManager
+
+        d = tempfile.mkdtemp(prefix="fs_mode_")
+        try:
+            cfg = Config(path=os.path.join(d, "config.json"))
+            cfg.data["smb"]["mode"] = "everyone"
+            cfg.data["smb"]["enabled"] = True
+            cfg.data["shares"] = []
+            mg = ShareManager(cfg)
+            mg.smb.available = lambda: (True, "OK")
+            mg.smb.guest_state = lambda: (
+                False, "来宾账户被「拒绝从网络访问这台计算机」拦住"
+                       "（错误 1385），免密访问在这台机器上走不通，请改用账号模式")
+            mg.smb.sync = lambda shares, readonly=True: ([], [])
+            mg.smb.repair = lambda *a, **k: ([], [])
+            mg.smb.diagnose = lambda *a, **k: []
+
+            mg.sync_smb()
+            self.assertEqual("account", cfg.get("smb", "mode"),
+                             "1385 时应当自动切到账号模式")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_keep_everyone_when_guest_works(self):
+        import os
+        import shutil
+        import tempfile
+
+        from fileshare.config import Config
+        from fileshare.server.manager import ShareManager
+
+        d = tempfile.mkdtemp(prefix="fs_mode2_")
+        try:
+            cfg = Config(path=os.path.join(d, "config.json"))
+            cfg.data["smb"]["mode"] = "everyone"
+            cfg.data["shares"] = []
+            mg = ShareManager(cfg)
+            mg.smb.available = lambda: (True, "OK")
+            mg.smb.guest_state = lambda: (True, "免密访问条件已就绪")
+            mg.smb.sync = lambda shares, readonly=True: ([], [])
+            mg.smb.repair = lambda *a, **k: ([], [])
+
+            mg.sync_smb()
+            self.assertEqual("everyone", cfg.get("smb", "mode"),
+                             "来宾能用时不要擅自动用户的设置")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)

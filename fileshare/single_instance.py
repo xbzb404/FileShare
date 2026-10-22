@@ -22,6 +22,7 @@ import ctypes
 import socket
 import sys
 import threading
+import time
 
 ACT_PORT = 47611                    # 激活通道端口（冷门；discovery 用 47610）
 MUTEX_NAME = "Local\\FileShare_SingleInstance_v1"
@@ -161,22 +162,30 @@ class SingleInstance(object):
         raise_by_title(self.title)
 
     def _activate_by_tcp(self):
-        try:
-            s = socket.create_connection(("127.0.0.1", self.port), timeout=0.6)
-        except OSError:
-            return False
-        try:
-            s.settimeout(0.8)
-            s.sendall(MAGIC)
-            reply = s.recv(32)
-        except OSError:
-            return False
-        finally:
+        # 重试几次：第一个实例可能刚起、监听线程还没跑到 accept（冷启动
+        # 或机器很忙时尤其明显），一次连不上就放弃会让「双击没反应」。
+        for attempt in range(6):
             try:
-                s.close()
+                s = socket.create_connection(("127.0.0.1", self.port),
+                                             timeout=0.5)
             except OSError:
-                pass
-        return reply.startswith(REPLY)
+                time.sleep(0.12)
+                continue
+            try:
+                s.settimeout(0.8)
+                s.sendall(MAGIC)
+                reply = s.recv(32)
+            except OSError:
+                reply = b""
+            finally:
+                try:
+                    s.close()
+                except OSError:
+                    pass
+            if reply.startswith(REPLY):
+                return True
+            time.sleep(0.12)
+        return False
 
     # ------------------------------------------------------------ 服务端
     def _start_server(self):

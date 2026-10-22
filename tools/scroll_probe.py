@@ -51,6 +51,20 @@ def max_first(ch, region):
     return (region - ch) / float(region)
 
 
+def tk_end(canvas):
+    """Tk 自己允许的最大首行比例：滚到最底，把它报的 yview 读回来。
+
+    不能只用 ``(region - winfo_height()) / region`` 推算：Tk 内部的可视
+    高度和 ``winfo_height`` 实测差 9px（``yscrollincrement`` 取整导致），
+    用推算值当上限会把「已经滚到真正的底部」误判成越界。
+    """
+    cur = canvas.yview()[0]
+    canvas.yview_moveto(1.0)
+    end = canvas.yview()[0]
+    canvas.yview_moveto(cur)
+    return end
+
+
 def main():
     from fileshare.config import Config
     from fileshare.ui.app import App
@@ -126,11 +140,19 @@ def main():
         # C. 能滚，但不越过末端
         wheel_down(c, 30)
         root.update()
+        # 页面内容异步变高（SMB 体检结果回来会重绘）：上限必须用**当下**的
+        # region 算，否则拿滚之前的高度去比，会误报「越界」。
+        ch_now, region_now = geom(c)
         first = c.yview()[0]
-        lim = max_first(ch, region)
+        lim = tk_end(c)
+        root.update()
         check("C:%s 长页滚动不越界" % key, 0.0 < first <= lim + 1e-6,
-              "region=%d viewport=%d yview=%.4f 上限=%.4f" % (region, ch,
-                                                             first, lim))
+              "region=%d viewport=%d yview=%.4f 末端=%.4f 推算=%.4f"
+              % (region_now, ch_now, first, lim,
+                 max_first(ch_now, region_now)))
+        # C2. 而且真的能滚到最底（钳制别把最后一行挡住）
+        check("C2:%s 能滚到内容末尾" % key, first >= lim - 1e-3,
+              "yview=%.4f 末端=%.4f" % (first, lim))
 
     # D. 切页不继承滚动比例
     app.show_page("servers")

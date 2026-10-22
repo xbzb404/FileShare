@@ -207,8 +207,8 @@ class ShareManager(object):
         pwd = self.cfg.get("smb", "password") or ""
         if not pwd:
             # 空密码在「账号模式」下必然连不上（系统禁止空密码网络登录），
-            # 给一个满足默认密码复杂度的兜底值，并在界面显示出来
-            pwd = "FileShare@123"
+            # 用与建账户时一致的默认值，避免「账户密码」和界面显示对不上
+            pwd = smb.SHARE_PASS
         return user, pwd
 
     def sync_smb(self):
@@ -216,6 +216,16 @@ class ShareManager(object):
         if not ok:
             self.last_error["smb"] = msg
             return False, msg
+
+        # 免密模式在这台机器上被安全策略堵死（Guest 禁止从网络登录）时，
+        # 自动切到账号模式：否则用户开着共享却永远连不上，还得自己猜原因。
+        if self._smb_mode() == "everyone":
+            guest_ok, why = self.smb.guest_state()
+            if not guest_ok and "1385" in (why or ""):
+                self.cfg.set("account", "smb", "mode")
+                self.cfg.save()
+                self.log.add("warn", "这台机器禁止 Guest 从网络登录，"
+                                     "免密模式不可用，已自动切换为账号模式", "SMB")
         readonly = bool(self.cfg.get("smb", "readonly", default=True))
         done, errors = self.smb.sync(self.shares(), readonly=readonly)
 
@@ -245,7 +255,9 @@ class ShareManager(object):
     def smb_diagnose(self):
         """SMB 能否被局域网其它机器访问的体检结果。"""
         try:
-            return self.smb.diagnose(self.shares(), mode=self._smb_mode())
+            user, pwd = self._smb_cred()
+            return self.smb.diagnose(self.shares(), mode=self._smb_mode(),
+                                     user=user, password=pwd)
         except Exception as exc:                            # noqa: BLE001
             self.log.add("err", "SMB 体检失败：%s" % exc, "SMB")
             return []

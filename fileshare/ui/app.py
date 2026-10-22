@@ -1004,7 +1004,8 @@ class App(object):
             p.c.create_window(p.x, p.y, window=sw3, anchor="nw")
             self._embedded.append(sw3)
             p.c.create_text(p.x + T.px(56), p.y + T.px(3),
-                            text="免密只读（Everyone 权限，其它设备直接进，不用账号）",
+                            text="免密只读（Everyone 权限；多数 Win10/11 会被策略拦住，"
+                                 "不推荐）",
                             anchor="nw", font=f.body, fill=t["tx"])
             p.y += T.px(32)
 
@@ -1039,13 +1040,34 @@ class App(object):
             elif st["smb"]["on"]:
                 p.mono_text(st["smb"]["url"], color=t["accent"])
                 if everyone:
-                    p.body("其它设备直接打开上面的地址即可，不用输入账号密码。",
-                           color=t["tx2"], font=f.small)
+                    p.body("免密模式：其它设备直接打开上面的地址即可。"
+                           "若对方机器仍弹「输入网络凭据」，说明它拦了来宾登录，"
+                           "关掉这个开关改用账号模式。",
+                           color=t["tx2"], font=f.small, width=p.w - T.px(20))
                 else:
-                    p.body("其它机器访问时输入用户名 %s、密码 %s"
-                           % (st["smb"].get("user") or "FileShare",
-                              st["smb"].get("password") or ""),
+                    user_v = st["smb"].get("user") or "FileShare"
+                    pwd_v = st["smb"].get("password") or ""
+                    p.body("对方机器上会弹「输入网络凭据」，照这样填：",
                            color=t["tx2"], font=f.small)
+                    p.gap(2)
+                    p.c.create_text(p.x, p.y,
+                                    text="用户名  %s        密码  %s"
+                                         % (user_v, pwd_v),
+                                    anchor="nw", font=f.body,
+                                    fill=t["accent"])
+                    p.y += T.px(24)
+                    bh = T.px(28)
+                    p.button(p.x, p.y, T.px(96), bh, "复制凭据",
+                             lambda: self._copy_smb_cred(user_v, pwd_v,
+                                                         st["smb"]["url"]),
+                             "ghost", font=f.small)
+                    p.c.create_text(
+                        p.x + T.px(108), p.y + T.px(6),
+                        text="地址要带共享名（\\\\IP\\共享名）：只输 \\\\IP 需要先枚举"
+                             "共享，系统默认拒绝，会一直卡在凭据框。",
+                        anchor="nw", font=f.tiny, fill=t["tx3"],
+                        width=p.w - T.px(130))
+                    p.y += bh + T.px(10)
             if st["smb"].get("error"):
                 p.body(st["smb"]["error"], color=t["status_warn"], font=f.tiny)
 
@@ -1077,6 +1099,22 @@ class App(object):
                                         anchor="nw", font=f.tiny, fill=t["tx3"],
                                         width=p.w - T.px(96))
                         p.y += T.px(18) * max(1, 1 + len(it["detail"]) // 46)
+
+                # 免密模式被系统策略堵死时，最快出路是换账号模式
+                guest_blocked = everyone and any(
+                    i.get("key") == "guest" and not i.get("fixable")
+                    for i in issues)
+                if guest_blocked:
+                    p.gap(4)
+                    p.body("这台机器禁止 Guest 从网络登录（安全策略），免密模式"
+                           "修不好，换成账号模式最省事：", color=t["status_warn"],
+                           font=f.small, width=p.w - T.px(20))
+                    p.gap(2)
+                    bh = T.px(32)
+                    p.button(p.x, p.y, T.px(180), bh, "改用账号模式（推荐）",
+                             lambda: self._set_smb_mode(False), "primary",
+                             font=f.small)
+                    p.y += bh + T.px(12)
 
                 # 上次修复失败的原因要留在界面上，不能只闪一下 toast
                 last = getattr(self, "_smb_last_repair", None)
@@ -1119,6 +1157,16 @@ class App(object):
             p.body("Windows 自带的 SMB 是内核态实现，局域网大文件传输比 HTTP 还快，"
                    "适合当网盘用。", color=t["tx3"], font=f.tiny)
         p.card(draw, pad=16)
+
+    def _copy_smb_cred(self, user, password, url):
+        """把地址 + 用户名 + 密码一起放进剪贴板（发给对方机器用）。"""
+        text = "地址：%s\n用户名：%s\n密码：%s" % (url, user, password)
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+        except tk.TclError:
+            return
+        self._toast("凭据已复制到剪贴板")
 
     def _set_smb_mode(self, everyone):
         """切换免密 / 账号模式。已在共享中时立刻按新模式重做一遍。"""

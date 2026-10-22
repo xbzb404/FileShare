@@ -227,21 +227,33 @@ class ScrollArea(tk.Frame):
         治两类病：
         1. 内容不满一屏却停在半山腰（跨页恢复比例 / 窗口放大后）；
         2. 越过内容末端（region 在两次渲染间变短留下的越界滚动态）。
+
+        「最底部」以 **Tk 自己的结论**为准（``yview_moveto(1.0)`` 后读返回值），
+        不用 ``winfo_height`` 推算 —— 两者实测差 9px（部分来自
+        ``yscrollincrement`` 的取整），拿推算值当上限会把最后一行内容判成
+        「越界」，回弹 9px 反而看不全。
         """
         try:
-            _ch, content, max_first = self._view_range()
             first = self.canvas.yview()[0]
+            self.canvas.yview_moveto(1.0)
+            end = self.canvas.yview()[0]
         except tk.TclError:                 # 窗口正在销毁，没什么可钳的
             return False
-        if first > max_first + 1e-6 or (max_first <= 0.0 and first != 0.0):
-            try:
-                self.canvas.yview_moveto(max_first)
-            except tk.TclError:
-                return False
-            if redraw:
-                self._draw_bar()
-            return True
-        return False
+        moved = False
+        try:
+            if first > end + 1e-6:
+                self.canvas.yview_moveto(end)          # 越过末端 → 收到最底
+                moved = True
+            elif end <= 0.0 and first > 0.0:
+                self.canvas.yview_moveto(0.0)          # 内容不满一屏 → 钉在顶部
+                moved = True
+            else:
+                self.canvas.yview_moveto(first)        # 没越界，还原原位
+        except tk.TclError:
+            return moved
+        if moved and redraw:
+            self._draw_bar()
+        return moved
 
     def _wheel(self, event):
         try:
@@ -315,7 +327,27 @@ class ScrollArea(tk.Frame):
             self._draw_bar()
         except tk.TclError:
             return
-        self._clamp_view()
+        if self._clamp_view():
+            return
+        # 窗口缩放 / 异步重绘时，视口和内容都可能还在变：这一刻算出来的
+        # 「最大可滚比例」未必是最终值（实测差 9px 就能留下越界滚动态）。
+        # 再补一次空闲期钳制，等几何稳定后收敛。
+        self._schedule_clamp()
+
+    def _schedule_clamp(self):
+        if getattr(self, "_clamp_job", None):
+            return
+        try:
+            self._clamp_job = self.canvas.after_idle(self._idle_clamp)
+        except tk.TclError:
+            self._clamp_job = None
+
+    def _idle_clamp(self):
+        self._clamp_job = None
+        try:
+            self._clamp_view()
+        except tk.TclError:
+            pass
 
     def reset_top(self):
         try:

@@ -401,7 +401,11 @@ class SmbManager(object):
         免密 = 别的机器不带凭据直连。Windows 要走通这条路，光给目录
         授权不够，还得让「空凭据」能登录成一个真实会话：
         * ``Guest`` 账户启用 —— 匿名连接会被映射到它；
-        * ``LimitBlankPasswordUse=0`` —— 否则 Guest 的空密码在网络登录时被拒。
+        * ``LimitBlankPasswordUse=0`` —— 否则 Guest 的空密码在网络登录时被拒；
+        * **Guest 必须真的能从网络登录**。Win10/11 默认把 Guest 放进
+          「拒绝从网络访问这台计算机」，只改前两项是白改：客户端仍然弹
+          「输入网络凭据」，输什么都进不去（错误 1385）。所以最后要
+          实连一次 IPC$ 验证。
         """
         rc, out = self._run(["net", "user", "Guest"])
         if rc != 0:
@@ -418,6 +422,14 @@ class SmbManager(object):
             ".LimitBlankPasswordUse", timeout=20)
         if rc == 0 and out.strip() == "1":
             return False, "系统禁止空密码网络登录（LimitBlankPasswordUse=1）"
+
+        ok_logon, why, code = self.test_logon("Guest", "")
+        if not ok_logon:
+            if code == 1385:
+                return False, ("来宾账户被「拒绝从网络访问这台计算机」拦住"
+                               "（错误 1385），免密访问在这台机器上走不通，"
+                               "请改用账号模式")
+            return False, "来宾账户登录验证不过：%s" % why
         return True, "免密访问条件已就绪"
 
     def enable_guest_access(self):
@@ -461,6 +473,36 @@ class SmbManager(object):
                 tail = line.split()[-1] if line.split() else ""
                 return tail.lower() not in ("no", "否")
         return True
+
+    # ------------------------------------------------------------ 登录验证
+    def test_logon(self, user=None, password="", host="127.0.0.1"):
+        """真连一次 ``\\\\主机\\IPC$`` 验证「网络登录」这条路通不通。
+
+        返回 ``(ok, 说明, 错误码)``。
+
+        为什么要真连：账户存在、密码也对，不代表别的机器连得上。
+        Win10/11 默认把 Guest 放进「拒绝从网络访问这台计算机」，
+        来宾连接直接报 **1385**——客户端那边看到的就是「输入网络凭据」，
+        怎么输都不对。只有走一遍网络登录才能暴露这类问题。
+
+        走本机回环，跟我们的共享建没建好无关；前后都清一次会话，
+        免得上一条凭据把结果搞混（错误 1219 就是这么来的）。
+        """
+        target = "\\\\%s\\IPC$" % host
+        self._run(["net", "use", target, "/delete", "/y"])
+        args = ["net", "use", target]
+        if password:
+            args.append(password)
+        args.append("/user:%s" % (user or "Guest"))
+        rc, out = self._run(args, timeout=25)
+        self._run(["net", "use", target, "/delete", "/y"])
+        if rc == 0:
+            return True, "登录验证通过", 0
+        code = 0
+        m = re.search(r"(?:系统错误|System error)\s*(\d+)", out or "")
+        if m:
+            code = int(m.group(1))
+        return False, _logon_reason(code, out), code
 
     # ------------------------------------------------------------ 防火墙
     def firewall_open(self):
@@ -529,7 +571,7 @@ if ($hit.Count -gt 0) { 'OPEN:' + (($hit | Sort-Object -Unique) -join ';') } els
         return False, "445 入站未放行（其它机器会被防火墙拦住）"
 
     # ------------------------------------------------------------ 诊断
-    def diagnose(self, shares=None, mode="account"):
+    def diagnose(self, shares=None, mode="account", user=None, password=""):
         """体检「别人能不能连进来」，返回问题清单。
 
         每项 ``{key, level, title, detail, fixable}``：``error`` = 一定连不上，
@@ -572,6 +614,7 @@ if ($hit.Count -gt 0) { 'OPEN:' + (($hit | Sort-Object -Unique) -join ';') } els
             })
 
         # 4) 登录方式（免密模式看 Guest，账号模式看专用账户）
+        account = None
         if mode == "everyone":
             guest_ok, why = self.guest_state()
             if not guest_ok:
@@ -579,19 +622,35 @@ if ($hit.Count -gt 0) { 'OPEN:' + (($hit | Sort-Object -Unique) -join ';') } els
                     "key": "guest", "level": "error",
                     "title": "免密（Everyone）访问条件不满足",
                     "detail": "%s。别的机器不带账号密码连过来会直接被拒。" % why,
-                    "fixable": True,
+                    # 被「拒绝从网络访问」政策拦住时，本程序改不动（那是
+                    # 安全策略，硬改等于给整机开来宾登录），只能换模式
+                    "fixable": "1385" not in why,
                 })
-            account = None
         else:
-            account, why = self.account_state()
-            if not account:
+            who = (user or SHARE_USER).strip()
+            if not self._user_enabled(who):
                 issues.append({
                     "key": "account", "level": "error",
-                    "title": "没有任何可用的网络登录账户",
-                    "detail": "%s。别的机器连过来会直接报「无法访问」，"
-                              "连用户名密码框都不弹。" % why,
+                    "title": "共享账户 %s 不存在或被禁用" % who,
+                    "detail": "对方连过来会直接报「无法访问」，连用户名密码框都不弹。",
                     "fixable": True,
                 })
+                account = who
+            else:
+                account = who
+                ok_logon, why, code = self.test_logon(who, password)
+                if not ok_logon:
+                    issues.append({
+                        "key": "logon", "level": "error",
+                        "title": "共享账户登录验证不过：%s" % why,
+                        "detail": ("账户存在，但用这组用户名密码走网络登录被拒；"
+                                   "对方机器上就会看到「输入网络凭据」，"
+                                   "输进去也不对。"
+                                   if code != 1385 else
+                                   "这个账户被安全策略禁止从网络登录，"
+                                   "换成别的用户名，或改用免密模式之外的账户。"),
+                        "fixable": code != 1385,
+                    })
 
         # 5) 目录 NTFS 权限（真问题：连上了但读不到文件）
         bad_dirs = []
@@ -676,6 +735,13 @@ if ($hit.Count -gt 0) { 'OPEN:' + (($hit | Sort-Object -Unique) -join ';') } els
                  lambda: self.ensure_account(user, password)[:2])
             principal = (user or SHARE_USER).strip()
 
+        # 账户建好不等于能连：再走一遍真实网络登录，结论才可信
+        if mode == "everyone":
+            step("验证免密登录", lambda: self.test_logon("Guest", "")[:2])
+        else:
+            step("验证账户登录",
+                 lambda: self.test_logon(principal, password)[:2])
+
         step("放行 TCP 445", self.firewall_open)
 
         targets = list(shares if shares is not None else self._managed_shares())
@@ -748,6 +814,26 @@ if ($hit.Count -gt 0) { 'OPEN:' + (($hit | Sort-Object -Unique) -join ';') } els
         if restore:
             return self.revoke_all(principals, paths)
         return [], []
+
+
+# 网络登录失败的常见错误码 → 人话
+_LOGON_HINTS = {
+    1326: "用户名或密码不正确",
+    1385: "这个账户被「拒绝从网络访问这台计算机」策略拦住（Guest 默认如此）",
+    1219: "本机已经用另一个身份连着这台机器，先断开已有连接再试",
+    1909: "账户被锁定（失败的登录次数太多）",
+    1331: "账户已被禁用",
+    1327: "账户没有网络登录权限",
+}
+
+
+def _logon_reason(code, raw=""):
+    hint = _LOGON_HINTS.get(code)
+    if hint:
+        return hint
+    if code:
+        return "网络登录失败（系统错误 %d）" % code
+    return _clean(raw) or "网络登录失败"
 
 
 def _norm_path(path):
