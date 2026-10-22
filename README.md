@@ -27,7 +27,8 @@
 
 **方式一：直接下载可执行文件**（推荐给只想用的）
 
-到本仓库的 [Releases](../../releases) 下载 `FileShare.exe`，双击即可（单文件、免安装、无依赖）。
+到本仓库的 [Releases](https://github.com/xbzb404/FileShare/releases) 下载 `FileShare.exe`，双击即可（单文件、免安装、无依赖）。
+当前最新版 **v1.1.4**：SMB 只支持指定账户并自动加固、FTP 可开匿名只读。
 
 **方式二：从源码运行**（Python 3.10+，无第三方依赖）
 
