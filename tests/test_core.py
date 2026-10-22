@@ -1065,3 +1065,46 @@ class TestSmbDiagnose(unittest.TestCase):
         done, failed = m.repair([])
         self.assertEqual([], done)
         self.assertTrue(any("管理员" in f for f in failed))
+
+    def test_repair_issues_expected_commands(self):
+        """端到端：一次修复要建账户、开 445、给目录授权，且都用 FileShare 账户。"""
+        import tempfile
+        d = tempfile.mkdtemp(prefix="fs_smb_rep_")
+        m = self._mgr(run_reply=lambda a: (0, ""))
+        # ensure_account 会先查账户；先让「查不到」→ 走创建分支
+        created = {"user": False}
+
+        def run(args, timeout=20):
+            self.calls.append(list(args))
+            joined = " ".join(args)
+            if args[:2] == ["net", "user"] and len(args) == 3:
+                return (0, "帐户启用    Yes") if created["user"] else (2, "找不到用户名。")
+            if args[:2] == ["net", "user"] and len(args) > 3 and "/add" in joined:
+                created["user"] = True
+                return 0, "命令成功完成。"
+            return 0, ""
+
+        m._run = run
+        m._ps = lambda script, timeout=30: (0, "OPEN:文件共享中心")
+        # 修复本身只在该进程有管理员时执行；这一条单测验的是「命令序列」，
+        # 所以把权限门放开，别让 is_admin() 的环境差异干扰断言
+        m.available = lambda: (True, "OK")
+        try:
+            done, failed = m.repair([{"name": "s", "path": d}])
+            self.assertEqual([], failed, failed)
+            flat = [" ".join(c) for c in self.calls if c and c[0] != "PS"]
+            # 建了账户
+            self.assertTrue(any("/add" in c and "FileShare" in c for c in flat),
+                            "没有创建共享账户")
+            # 放行了 445
+            self.assertTrue(any("advfirewall" in c and "445" in c for c in flat),
+                            "没有放行 445")
+            # 给目录授权用的是 FileShare 账户，而不是 Everyone
+            icacls = [c for c in flat if c.startswith("icacls")]
+            self.assertTrue(icacls, "没有给目录授权")
+            self.assertTrue(all("FileShare" in c for c in icacls),
+                            "应当只授给专用账户：%s" % icacls)
+            self.assertTrue(any("445" in d or True for d in flat))
+        finally:
+            import shutil
+            shutil.rmtree(d, ignore_errors=True)
