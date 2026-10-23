@@ -49,6 +49,7 @@ def build(hardened=True):
         st["smb"]["user"] = "FileShare"
         st["smb"]["password"] = "fileshare"
         st["smb"]["hardened"] = hardened
+        st["smb"]["dirs"] = ["Fshare"]
         return st
 
     app.manager.status = patched
@@ -79,7 +80,10 @@ def run():
         check("提示弹凭据框", any("输入网络凭据" in t for t in ts))
         check("提示带共享名", any("只输" in t and "枚举" in t for t in ts))
         check("有复制按钮", any("复制凭据" in t for t in ts))
-        check("已加固时有说明", any("只能从网络登录" in t for t in ts))
+        check("已加固时说明禁止哪些登录",
+              any("禁止系统登录" in t and "计划任务" in t for t in ts))
+        check("已加固时说明权限范围",
+              any("权限仅限指定目录" in t and "Fshare" in t for t in ts))
         check("不再有免密开关", not any("免密只读" in t for t in ts))
         check("不再有换模式按钮", not any("改用账号模式" in t for t in ts))
         check("写明只能用这个账户", any("只能用这个账户访问" in t for t in ts))

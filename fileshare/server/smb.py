@@ -192,7 +192,7 @@ class SmbManager(object):
         self.managed.discard(name)
 
     # ------------------------------------------------------------ NTFS 授权
-    def grant_ntfs(self, path, readonly=True, account=None):
+    def grant_ntfs(self, path, readonly=True, account=None, force=False):
         """给共享目录授权，让共享账户能读到文件。
 
         只授给**指定账户**（默认 ``FileShare``），不再有「Everyone」这条路：
@@ -201,13 +201,17 @@ class SmbManager(object):
 
         已经能访问就不重复加 ACE（否则取消共享时无法区分「本来就有」
         还是「我们加的」，还原权限会误删用户自己的授权）。
+
+        ``force=True`` 时不看「继承来的 Everyone/Users 已经能读」这种
+        情况，一定写上属于这个账户的显式 ACE —— 目录换过之后要把
+        只读/可写级别固定下来，靠继承权限是控制不住的。
         """
         if not os.path.isdir(path):
             return False, "目录不存在"
         if path not in self._last_paths:
             self._last_paths.append(path)
         who = (account or SHARE_USER).strip() or SHARE_USER
-        if self._ntfs_allows(path, who):
+        if not force and self._ntfs_allows(path, who):
             return True, "已有权限，无需改动"
         grant = "(OI)(CI)(RX)" if readonly else "(OI)(CI)(M)"
         rc, out = self._run(["icacls", path, "/grant",
@@ -264,6 +268,145 @@ class SmbManager(object):
                             and who in ("everyone", "s-1-1-0")):
                     return True
         return False
+
+    def _explicit_rights(self, path, principal):
+        """目录里授给 ``principal`` 的**显式** ACE 权限串（如 ``(OI)(CI)(RX)``）。
+
+        返回 ``None`` 表示没有显式授权（只有继承来的不算）。
+        用来判断「权限级别对不对」：只读要 ``(RX)``、可写要 ``(M)``，
+        级别变了必须先撤再加 —— ``icacls /grant`` 只会往上叠加，
+        从「可写」降成「只读」光加一条 ``(RX)`` 是没有效果的。
+        """
+        rc, out = self._run(["icacls", path])
+        if rc != 0:
+            return None
+        target = str(principal).lower()
+        host = (os.environ.get("COMPUTERNAME") or "").lower()
+
+        def norm(s):
+            return s.replace("\\", "/").lower()
+
+        prefix = norm(os.path.normpath(path))
+        for line in out.replace("\r", "").split("\n"):
+            text = norm(line).strip()
+            if text.startswith(prefix):
+                text = text[len(prefix):]
+            for m in re.finditer(r"([^()]+?):((?:\([^)]*\))+)", text):
+                who = m.group(1).strip().lstrip("*")
+                flags = m.group(2)
+                if who != target and who != "%s/%s" % (host, target):
+                    continue
+                if "(i)" in flags:
+                    continue            # 继承来的，不是我们加的
+                return flags.upper()
+        return None
+
+    def _forget(self, path, principal):
+        """从「我加过的授权」记录里删掉一条（撤销成功后调用）。"""
+        changed = False
+        for item in list(self.granted):
+            if _norm_path(item[0]) == _norm_path(path) \
+                    and _same_principal(item[1], principal):
+                self.granted.remove(item)
+                changed = True
+        if changed:
+            self._save_granted()
+
+    def sync_ntfs(self, shares, readonly=True, account=None):
+        """让「哪些目录对这个账户开放」跟当前共享列表完全一致。
+
+        做两件事：
+
+        1. **收回**不再需要的授权 —— 目录被移出共享、共享换了目录、或者
+           账户改了名字，旧 ACE 必须撤掉。不撤的话「仅限指定目录」只是
+           一句口号：以前共享过的目录，这个账户至今照样进得去。
+        2. **补上 / 纠正**当前的授权 —— 缺的补上；只读↔可写切换时先
+           ``/remove:g`` 再加（见 ``_explicit_rights`` 的说明）。
+
+        返回 ``(done, failed)``，都是给人看的中文短句。
+        """
+        who = (account or SHARE_USER).strip() or SHARE_USER
+        want = {}
+        for s in (shares or []):
+            path = (s.get("path") if isinstance(s, dict) else s) or ""
+            if not path or not os.path.isdir(path):
+                continue
+            ro = bool(s.get("readonly", readonly)) if isinstance(s, dict) \
+                else bool(readonly)
+            want[_norm_path(path)] = (path, ro)
+
+        done, failed = [], []
+
+        # 1) 多删
+        for path, principal in list(self.granted):
+            if _norm_path(path) in want and _same_principal(principal, who):
+                continue
+            label = os.path.basename(str(path).rstrip("\\/")) or str(path)
+            if not os.path.isdir(path):
+                # 目录都不在了，ACE 随目录一起消失，只清记录
+                self._forget(path, principal)
+                continue
+            ok, why = self.revoke_ntfs(path, principal)
+            if ok:
+                self._forget(path, principal)
+                done.append("收回 %s（已不在共享列表）" % label)
+            else:
+                failed.append("收回 %s 权限失败%s"
+                              % (label, "：" + why if why else ""))
+
+        # 2) 少补
+        for key, (path, ro) in want.items():
+            label = os.path.basename(path.rstrip("\\/")) or path
+            cur = self._explicit_rights(path, who)
+            if cur is not None and _ace_writable(cur) == (not ro):
+                continue                        # 已经是对的样子
+            if cur is not None:
+                ok, why = self.revoke_ntfs(path, who)
+                if not ok:
+                    failed.append("调整 %s 权限失败%s"
+                                  % (label, "：" + why if why else ""))
+                    continue
+                self._forget(path, who)
+            ok, why = self.grant_ntfs(path, readonly=ro, account=who, force=True)
+            if ok:
+                done.append("授权 %s（%s）" % (label, "只读" if ro else "读写"))
+            else:
+                failed.append("授权 %s 失败：%s" % (label, why))
+
+        if self.log is not None:
+            for d in done:
+                self.log.add("ok", "SMB 目录权限：" + d, "SMB")
+            for f in failed:
+                self.log.add("warn", "SMB 目录权限：" + f, "SMB")
+        return done, failed
+
+    def other_reach(self, account=None, exclude=None):
+        """本机**其它**共享里，这个账户也能进的有哪些 → ``[(共享名, 路径)]``。
+
+        「仅限指定目录」在网络上只能靠「只把这几条 ACE 授给它」实现：
+        SMB 只暴露共享目录，别的路径它连名字都没有。所以剩下的漏点就是
+        「本机还有别的共享对它开放」（共享权限默认是 Everyone 读）。
+
+        这里只**列出来**让人自己决定，不去动用户自建的共享 —— 那属于
+        别人的配置，动了可能把人家正在用的东西弄断。
+        """
+        who = (account or SHARE_USER).strip() or SHARE_USER
+        skip = {_norm_path(p) for p in (exclude or []) if p}
+        out = []
+        for name, path in self.list_all().items():
+            if name.endswith("$"):
+                continue                    # C$ / ADMIN$ / IPC$ 管理共享
+            if not path or not os.path.isdir(path):
+                continue
+            if _norm_path(path) in skip:
+                continue                    # 我们自己建的共享
+            if not self._ntfs_allows(path, who):
+                continue
+            perm = (self.info(name) or {}).get("perm") or ""
+            if perm and not _perm_open(perm, who):
+                continue
+            out.append((name, path))
+        return out
 
     def drop_legacy_everyone(self, paths=None):
         """收回老版本（免密模式）授给 Everyone 的目录权限 → ``(done, failed)``。
@@ -447,8 +590,10 @@ class SmbManager(object):
         四件事：
         1. 用户不能改密码（改了之后所有客户端一起连不上）；
         2. 密码永不过期（否则 42 天后突然全断）；
-        3. 只留在 Users 组 —— 从管理员 / 远程桌面用户 / 备份操作员里踢掉；
-        4. **拒绝本地登录、远程桌面、作为服务登录**，只保留「从网络访问」。
+        3. 只留在 Users 组 —— 从管理员 / 备份操作员 / 远程桌面用户 /
+           远程管理用户（WinRM）里踢掉；
+        4. **拒绝本地登录、远程桌面、计划任务、作为服务登录**，只保留
+           「从网络访问」。
 
         第 4 项用 LSA 的 ``LsaAddAccountRights`` 逐条加。不用 ``secedit``
         整体导入：那会把「用户权利分配」整块覆盖，可能顺手改掉别人的配置。
@@ -460,11 +605,10 @@ class SmbManager(object):
         self._ps("Set-LocalUser -Name '%s' -PasswordNeverExpires $true "
                  "-ErrorAction SilentlyContinue" % who)
         # 按 SID 踢组：组名在中文系统里是本地化的，SID 不会变
-        # （544 管理员 / 551 备份操作员 / 555 远程桌面用户）
-        self._ps("$u='%s'; foreach($sid in 'S-1-5-32-544','S-1-5-32-551',"
-                 "'S-1-5-32-555'){ $g=Get-LocalGroup -SID $sid "
+        self._ps("$u='%s'; foreach($sid in %s){ $g=Get-LocalGroup -SID $sid "
                  "-ErrorAction SilentlyContinue; if($g){ Remove-LocalGroupMember "
-                 "-Group $g -Member $u -ErrorAction SilentlyContinue } }" % who)
+                 "-Group $g -Member $u -ErrorAction SilentlyContinue } }"
+                 % (who, ",".join("'%s'" % s for s in PRIV_GROUP_SIDS)))
 
         sid = _account_sid(who)
         if sid is None:
@@ -682,8 +826,29 @@ if ($hit.Count -gt 0) { 'OPEN:' + (($hit | Sort-Object -Unique) -join ';') } els
                     "key": "harden", "level": "warn",
                     "title": "共享账户还没限制登录方式",
                     "detail": "%s。点修复会拒绝它的本地登录 / 远程桌面 / "
-                              "服务登录，只保留网络访问。" % why_h,
+                              "计划任务 / 服务登录，只保留网络访问。" % why_h,
                     "fixable": True,
+                })
+
+            # 4c) 权限范围：本机还有别的共享对这个账户开放吗
+            try:
+                mine = [x.get("path") if isinstance(x, dict) else x
+                        for x in (shares if shares is not None
+                                  else self._managed_shares())]
+                leak = self.other_reach(who, exclude=[p for p in mine if p])
+            except Exception:                               # noqa: BLE001
+                leak = []
+            if leak:
+                names = "、".join(n for n, _p in leak[:4])
+                if len(leak) > 4:
+                    names += " 等 %d 个" % len(leak)
+                issues.append({
+                    "key": "reach", "level": "warn",
+                    "title": "该账户还能访问本机另外 %d 个共享" % len(leak),
+                    "detail": "%s。它们不是本程序建的；要「只认这几个目录」，"
+                              "得在「计算机管理 → 共享文件夹」里收紧或停用。"
+                              % names,
+                    "fixable": False,
                 })
 
         # 5) 目录 NTFS 权限（真问题：连上了但读不到文件）
@@ -762,13 +927,15 @@ if ($hit.Count -gt 0) { 'OPEN:' + (($hit | Sort-Object -Unique) -join ';') } els
         step("放行 TCP 445", self.firewall_open)
 
         targets = list(shares if shares is not None else self._managed_shares())
-        for s in targets:
-            path = s.get("path") if isinstance(s, dict) else s
-            if not path or not os.path.isdir(path):
-                continue
-            label = "授权 %s" % os.path.basename(path.rstrip("\\/"))
-            step(label, lambda p=path: self.grant_ntfs(
-                p, readonly=readonly, account=principal))
+        # 目录授权「多删少补」：不再共享的目录要收回权限、换过的目录要重授、
+        # 只读/可写改了级别要重设。只加不减的话「仅限指定目录」就是空话。
+        try:
+            g_done, g_fail = self.sync_ntfs(targets, readonly=readonly,
+                                            account=principal)
+            done.extend(g_done)
+            failed.extend(g_fail)
+        except Exception as exc:                            # noqa: BLE001
+            failed.append("同步目录权限：%s" % exc)
 
         if self.log is not None:
             for d in done:
@@ -838,12 +1005,28 @@ if ($hit.Count -gt 0) { 'OPEN:' + (($hit | Sort-Object -Unique) -join ';') } els
 
 
 # ------------------------------------------------------------ 用户权利（LSA）
-# 拒绝「本地登录 / 远程桌面 / 作为服务登录」，只保留「从网络访问」。
-# 这样这个账户除了走 SMB，登不进桌面、开不了远程、也跑不了服务。
+# 拒绝「本地登录 / 远程桌面 / 批处理（计划任务）/ 作为服务登录」，
+# 只保留「从网络访问」。这样这个账户除了走 SMB，登不进桌面、开不了远程、
+# 跑不了服务，也没法被挂成计划任务在后台执行。
 RIGHT_DENY_INTERACTIVE = "SeDenyInteractiveLogonRight"
 RIGHT_DENY_REMOTE = "SeDenyRemoteInteractiveLogonRight"
+RIGHT_DENY_BATCH = "SeDenyBatchLogonRight"
 RIGHT_DENY_SERVICE = "SeDenyServiceLogonRight"
-DENY_RIGHTS = (RIGHT_DENY_INTERACTIVE, RIGHT_DENY_REMOTE, RIGHT_DENY_SERVICE)
+DENY_RIGHTS = (RIGHT_DENY_INTERACTIVE, RIGHT_DENY_REMOTE,
+               RIGHT_DENY_BATCH, RIGHT_DENY_SERVICE)
+
+# 给人看的名字：界面和日志里说「拒了哪几种登录」，别只丢一串 SeXxx
+RIGHT_LABELS = {
+    RIGHT_DENY_INTERACTIVE: "本地登录",
+    RIGHT_DENY_REMOTE: "远程桌面",
+    RIGHT_DENY_BATCH: "计划任务",
+    RIGHT_DENY_SERVICE: "服务登录",
+}
+
+# 有这个账户就不该待的组，按 SID 踢（组名在中文系统里是本地化的，SID 不变）：
+# 544 管理员 / 551 备份操作员 / 555 远程桌面用户 / 580 远程管理用户（WinRM）
+PRIV_GROUP_SIDS = ("S-1-5-32-544", "S-1-5-32-551",
+                   "S-1-5-32-555", "S-1-5-32-580")
 
 _POLICY_ALL_ACCESS = 0x00F0FFF
 
@@ -993,6 +1176,41 @@ def _norm_path(path):
 
 def _same_path(a, b):
     return bool(a) and bool(b) and _norm_path(a) == _norm_path(b)
+
+
+def _same_principal(a, b):
+    """两个身份名是不是同一个账户（``主机\\名`` 与 ``名`` 算同一个）。"""
+    x = str(a or "").strip().lower().replace("/", "\\")
+    y = str(b or "").strip().lower().replace("/", "\\")
+    if not x or not y:
+        return False
+    if x == y:
+        return True
+    return x.split("\\")[-1] == y.split("\\")[-1]
+
+
+def _ace_writable(flags):
+    """ACE 权限串里有没有写权限（``(M)`` 修改 / ``(F)`` 完全 / ``(W)`` 写）。"""
+    up = (flags or "").upper()
+    return "(F)" in up or "(M)" in up or "(W)" in up
+
+
+def _perm_open(perm, who):
+    """共享权限行是否对这个账户（或「所有人」这类宽身份）开放。
+
+    ``net share <名>`` 的权限行形如 ``FileShare, READ`` 或 ``Everyone, READ``。
+    一行都没有时按系统默认处理：Everyone 读。
+    """
+    low = (perm or "").lower()
+    if not low:
+        return True
+    if (who or "").lower() in low:
+        return True
+    for broad in ("everyone", "users", "authenticated", "所有人",
+                  "经过身份验证", "用户"):
+        if broad in low:
+            return True
+    return False
 
 
 # 交互确认留下的残渣：这些句子不该出现在界面上

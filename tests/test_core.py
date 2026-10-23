@@ -1611,7 +1611,7 @@ class TestSmbHardening(unittest.TestCase):
         finally:
             (smb_mod._account_sid, smb_mod._lsa_account_rights) = orig
         self.assertFalse(ok)
-        self.assertEqual(2, len(missing))
+        self.assertEqual(len(smb_mod.DENY_RIGHTS) - 1, len(missing))
         self.assertIn("缺", why)
 
     def test_harden_reports_failure_instead_of_lying(self):
@@ -1709,3 +1709,166 @@ class TestReleaseNotesLint(unittest.TestCase):
         for name in files:
             hits = lint(os.path.join(docs, name))
             self.assertEqual([], hits, "%s 有问题：%s" % (name, hits[:3]))
+
+
+class TestSmbConfinement(unittest.TestCase):
+    """「账户只认指定目录」：目录换了权限要跟着换，旧授权必须收回。
+
+    只加权限不叫受限：共享目录从 A 换成 B 之后，A 上的 ACE 还留着，
+    这个账户照样进得去 A —— 那就是个长期后门。所以要求两条：
+    1. 加/删共享、换目录、换账户名时，旧目录上的显式 ACE 一律撤销；
+    2. 只读↔可写切换时先 ``/remove:g`` 再加（``/grant`` 只会叠加）。
+    """
+
+    def _mgr(self, acl):
+        from fileshare.server.smb import SmbManager
+
+        m = SmbManager()
+        self.calls = []
+
+        def fake(args, timeout=20):
+            self.calls.append(list(args))
+            if not args or args[0] != "icacls":
+                return 0, ""
+            path = args[1]
+            if len(args) == 2:                      # 查询 ACL
+                lines = [path]
+                for who, flags in acl.get(path, {}).items():
+                    lines.append("%s %s:%s" % (path, who, flags))
+                lines.append("%s BUILTIN/Users:(I)(RX)" % path)
+                return 0, "\n".join(lines)
+            if args[2] == "/grant":
+                who, flags = args[3].split(":", 1)
+                acl.setdefault(path, {})[who] = flags
+                return 0, "已成功处理 1 个文件"
+            if args[2] == "/remove:g":
+                acl.setdefault(path, {}).pop(args[3], None)
+                return 0, "已成功处理 1 个文件"
+            return 0, ""
+
+        m._run = fake
+        return m
+
+    @staticmethod
+    def _dir(tag):
+        return tempfile.mkdtemp(prefix="fs_cf_%s_" % tag)
+
+    def test_dir_switch_revokes_old_acl(self):
+        a, b = self._dir("a"), self._dir("b")
+        try:
+            acl = {a: {}, b: {}}
+            m = self._mgr(acl)
+            m.granted = [[a, "FileShare"], [b, "FileShare"]]
+            done, failed = m.sync_ntfs([{"path": b}], readonly=True,
+                                       account="FileShare")
+            self.assertEqual([], failed, failed)
+            flat = [" ".join(c) for c in self.calls]
+            self.assertTrue(any("/remove:g" in c and a in c for c in flat),
+                            "旧目录上的授权没收回：%s" % flat)
+            self.assertNotIn("FileShare", acl[a], "撤权后账户还能进旧目录")
+            self.assertEqual("(OI)(CI)(RX)", acl[b].get("FileShare"),
+                             "新目录没授权上")
+            self.assertEqual([os.path.normpath(b)],
+                             [os.path.normpath(x[0]) for x in m.granted],
+                             "记录里还留着旧目录，下次重启又会漏一次")
+        finally:
+            shutil.rmtree(a, ignore_errors=True)
+            shutil.rmtree(b, ignore_errors=True)
+
+    def test_level_change_rebuilds_ace(self):
+        a = self._dir("lvl")
+        try:
+            acl = {a: {"FileShare": "(OI)(CI)(RX)"}}
+            m = self._mgr(acl)
+            m.granted = [[a, "FileShare"]]
+            done, failed = m.sync_ntfs([{"path": a}], readonly=False,
+                                       account="FileShare")
+            self.assertEqual([], failed, failed)
+            self.assertEqual("(OI)(CI)(M)", acl[a]["FileShare"],
+                             "只读→可写没生效：icacls /grant 只会叠加")
+            flat = [" ".join(c) for c in self.calls]
+            self.assertTrue(any("/remove:g" in c for c in flat),
+                            "降级/升级前必须先删旧 ACE：%s" % flat)
+        finally:
+            shutil.rmtree(a, ignore_errors=True)
+
+    def test_correct_ace_is_left_alone(self):
+        """已经对的样子不该再动：每次同步都改 ACL 会把正在读的文件卡住。"""
+        a = self._dir("same")
+        try:
+            acl = {a: {"FileShare": "(OI)(CI)(RX)"}}
+            m = self._mgr(acl)
+            m.granted = [[a, "FileShare"]]
+            done, failed = m.sync_ntfs([{"path": a}], readonly=True,
+                                       account="FileShare")
+            self.assertEqual(([], []), (done, failed))
+            self.assertEqual([], [c for c in self.calls if len(c) > 2],
+                             "重复同步不该改 ACL：%s" % self.calls)
+        finally:
+            shutil.rmtree(a, ignore_errors=True)
+
+    def test_account_rename_revokes_old_principal(self):
+        """界面里改了共享用户名：旧账户的授权必须撤掉，否则等于留了个后门。"""
+        a = self._dir("ren")
+        try:
+            acl = {a: {"OldUser": "(OI)(CI)(RX)"}}
+            m = self._mgr(acl)
+            m.granted = [[a, "OldUser"]]
+            done, failed = m.sync_ntfs([{"path": a}], readonly=True,
+                                       account="FileShare")
+            self.assertEqual([], failed, failed)
+            self.assertNotIn("OldUser", acl[a], "旧账户的权限没收回")
+            self.assertEqual("(OI)(CI)(RX)", acl[a].get("FileShare"))
+        finally:
+            shutil.rmtree(a, ignore_errors=True)
+
+    def test_inherited_ace_is_not_ours(self):
+        """继承来的 ``(I)`` 不算「我们加的」：不然还原权限会删用户的配置。"""
+        from fileshare.server.smb import SmbManager
+
+        m = SmbManager()
+        m._run = lambda args, timeout=20: (
+            0, "X:\\d FileShare:(I)(RX)")
+        self.assertIsNone(m._explicit_rights("X:\\d", "FileShare"))
+
+    def test_other_reach_lists_foreign_shares(self):
+        """「仅限目录」的漏点：本机别的共享也对这个账户开放。"""
+        mine, other = self._dir("mine"), self._dir("oth")
+        try:
+            m = self._mgr({mine: {}, other: {}})
+            m.list_all = lambda: {"mine": mine, "docs": other,
+                                  "C$": "C:/"}
+            m.info = lambda name: {"perm": "Everyone, READ"}
+            m._ntfs_allows = lambda path, who=None: path == other
+            reach = m.other_reach("FileShare", exclude=[mine])
+            self.assertEqual(["docs"], [n for n, _p in reach],
+                             "别的共享被漏报，界面上就会说「仅限」而其实不限于")
+        finally:
+            shutil.rmtree(mine, ignore_errors=True)
+            shutil.rmtree(other, ignore_errors=True)
+
+    def test_deny_rights_cover_all_logon_types_except_network(self):
+        from fileshare.server import smb as smb_mod
+
+        rights = list(smb_mod.DENY_RIGHTS)
+        self.assertIn(smb_mod.RIGHT_DENY_BATCH, rights,
+                      "计划任务登录也要拒：否则能被挂成后台任务跑")
+        self.assertFalse([r for r in rights if "Network" in r],
+                         "不能拒绝网络登录，否则 SMB 直接废掉")
+        self.assertEqual(set(rights), set(smb_mod.RIGHT_LABELS),
+                         "每条拒绝权利都要有中文名，界面和日志才说人话")
+
+    def test_perm_open_recognises_broad_principals(self):
+        from fileshare.server.smb import _perm_open
+
+        self.assertTrue(_perm_open("Everyone, READ", "FileShare"))
+        self.assertTrue(_perm_open("", "FileShare"), "没写权限行 = 默认 Everyone")
+        self.assertTrue(_perm_open("FileShare, READ", "FileShare"))
+        self.assertFalse(_perm_open("alice, READ", "FileShare"))
+
+    def test_same_principal_handles_domain_prefix(self):
+        from fileshare.server.smb import _same_principal
+
+        self.assertTrue(_same_principal("FileShare", "fileshare"))
+        self.assertTrue(_same_principal("pc/FileShare", "FileShare"))
+        self.assertFalse(_same_principal("FileShare2", "FileShare"))

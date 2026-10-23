@@ -379,6 +379,11 @@ class ShareManager(object):
             "hardened": self.smb.check_hardening(self._smb_cred()[0])[0],
             "user": self._smb_cred()[0],
             "password": self._smb_cred()[1],
+            # 该账户的权限范围：界面要直说「只限这几个目录」，
+            # 而不是让人自己去翻 ACL
+            "dirs": [os.path.basename((s.get("path") or "").rstrip("\\/"))
+                     or (s.get("path") or "")
+                     for s in self.shares() if (s.get("path") or "")],
             "issues": [],
         }
         st["ip"] = ip

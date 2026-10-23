@@ -1066,9 +1066,19 @@ class App(object):
                     width=p.w - T.px(130))
                 p.y += bh + T.px(8)
                 if st["smb"].get("hardened"):
-                    p.body("该账户已限制为「只能从网络登录」：本地/远程桌面/"
-                           "服务登录都被拒绝，只能访问这里的共享。",
+                    p.body("✓ 该账户禁止系统登录：本地登录、远程桌面、计划任务、"
+                           "服务登录全部拒绝，只剩网络访问。",
                            color=t["status_ok"], font=f.tiny)
+                    dirs = st["smb"].get("dirs") or []
+                    if dirs:
+                        shown = "、".join(dirs[:3]) + ("…" if len(dirs) > 3
+                                                       else "")
+                        p.body("✓ 权限仅限指定目录：%s。加/删共享或换目录后，"
+                               "旧目录上的授权会自动收回。" % shown,
+                               color=t["status_ok"], font=f.tiny)
+                    else:
+                        p.body("还没有共享目录：添加共享后才会给它授权。",
+                               color=t["tx3"], font=f.tiny)
                 else:
                     p.body("该账户目前还能用于本地或远程桌面登录；点下方"
                            "「修复局域网访问」可把它限制成只能网络访问。",
@@ -1131,8 +1141,9 @@ class App(object):
                              "修复局域网访问", self._smb_repair, "primary",
                              font=f.small)
                     p.y += bh + T.px(12)
-                    hint = ("修复会：创建/更新共享账户 %s 并限制它只能网络登录、"
-                            "放行 TCP 445、把共享目录只授给该账户。"
+                    hint = ("修复会：创建/更新共享账户 %s 并拒绝它的本地登录、"
+                            "远程桌面、计划任务、服务登录，放行 TCP 445，"
+                            "把共享目录只授给该账户（不再共享的目录会收回权限）。"
                             % (st["smb"].get("user") or "FileShare"))
                     p.c.create_text(
                         p.x, p.y,
